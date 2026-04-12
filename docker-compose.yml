@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  sandfish:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sandfish:latest
+    container_name: sandfish
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./vault:/app/vault
+      - ./logs:/app/logs
+    environment:
+      - OMPA_VAULT_PATH=/app/vault
+      - SANDFISH_ENV=production
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Optional: Run simulations in background
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sandfish:latest
+    container_name: sandfish-orchestrator
+    command: ["sandfish", "orchestrator", "--vault", "/app/vault", "--rounds", "1000"]
+    volumes:
+      - ./vault:/app/vault
+      - ./logs:/app/logs
+    environment:
+      - OMPA_VAULT_PATH=/app/vault
+    profiles:
+      - orchestrator
+    restart: "no"
+
+volumes:
+  vault:
+    driver: local
+  logs:
+    driver: local
