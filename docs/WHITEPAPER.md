@@ -275,28 +275,16 @@ spec:
 
 ---
 
-## 7. Future Work
+## 7. Future Directions
 
-### 7.1 Near-term (v0.2.0)
+SandFish is under active development with focus on:
 
-- [ ] CI/CD pipeline with GitHub Actions
-- [ ] Additional agent types (BotAgent, CriticAgent)
-- [ ] Web dashboard for visualization
-- [ ] Performance optimizations (caching, connection pooling)
+- **Scalability**: Distributed simulation across multiple nodes
+- **Integration**: Real-time market data feeds and trading APIs
+- **Intelligence**: Enhanced agent reasoning capabilities
+- **Enterprise**: Security, compliance, and management features
 
-### 7.2 Medium-term (v0.5.0)
-
-- [ ] Distributed simulation mode
-- [ ] PostgreSQL backend for OMPA
-- [ ] GPU acceleration for embeddings
-- [ ] Reinforcement learning integration
-
-### 7.3 Long-term (v1.0.0)
-
-- [ ] Real-time market data integration
-- [ ] Automated strategy optimization
-- [ ] Multi-modal agent communication
-- [ ] Enterprise SSO and RBAC
+The project welcomes community contributions and follows semantic versioning for releases.
 
 ---
 
