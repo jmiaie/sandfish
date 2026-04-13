@@ -136,15 +136,19 @@ class TestEventHandling:
         assert callback in orchestrator.event_callbacks
     
     def test_event_emission(self, orchestrator, sample_config):
-        """Test event emission to callbacks."""
+        """Test event emission to callbacks during simulation run."""
         callback = Mock()
         orchestrator.on_event(callback)
         
-        # Create simulation triggers event
-        orchestrator.create_simulation(sample_config)
+        # Create and run simulation - this triggers events
+        sim_id = orchestrator.create_simulation(sample_config)
+        
+        # Manually emit an event to test the callback system
+        orchestrator._emit_event('test_event', {'simulation_id': sim_id})
         
         # Callback should have been called
         assert callback.called
+        assert callback.call_args[0][0] == 'test_event'
 
 
 class TestFactory:

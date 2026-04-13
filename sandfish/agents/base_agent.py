@@ -49,7 +49,7 @@ class AgentProfile:
 
 
 @dataclass
-class AgentState:
+class AgentStateData:
     """Dynamic state of an agent during simulation."""
     energy: float = 100.0
     mood: float = 50.0
@@ -97,7 +97,7 @@ class BaseAgent(ABC):
         self.memory = memory_adapter
         
         # Dynamic state
-        self.state = AgentState()
+        self.state = AgentStateData()
         self.status = AgentState.INITIALIZING
         
         # Simulation context

@@ -91,7 +91,10 @@ class TestBaseAgent:
         """Test action execution."""
         await agent.initialize({})
         
+        # Deplete some energy first
+        agent.state.energy = 50
         initial_energy = agent.state.energy
+        
         action = Action(action_type=ActionType.DO_NOTHING)
         
         await agent.execute_action(action)
