@@ -1,305 +1,384 @@
 """
 OMPA integration layer for SandFish.
 
-Replaces Zep Cloud with local, zero-cost OMPA memory system.
-Provides: semantic search, knowledge graph, entity management
+Provides:
+- Semantic search
+- Knowledge graph (entities + relations)
+- Event log with simulation history retrieval
+
+If the optional `ompa` package is installed, queries are dispatched to it.
+Otherwise an in-memory fallback backend is used so the rest of the system
+remains usable for development, testing, and small simulations.
 """
 
-from typing import List, Dict, Any, Optional
-from dataclasses import dataclass
-from pathlib import Path
-import json
+from __future__ import annotations
 
-# OMPA imports
-try:
-    from ompa import Ompa
-    from ompa.core import MessageType
-    HAS_Ompa = True
-except ImportError:
-    HAS_Ompa = False
+import json
+import logging
+import threading
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger("sandfish.memory")
+
+
+# Try to import the real OMPA SDK; fall back to in-memory backend if missing.
+try:  # pragma: no cover - exercised only when OMPA is installed
+    from ompa import Ompa  # type: ignore
+
+    HAS_OMPA = True
+except Exception:
+    Ompa = None  # type: ignore
+    HAS_OMPA = False
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 @dataclass
 class Entity:
-    """Represents an entity in the knowledge graph."""
+    """An entity in the knowledge graph."""
     name: str
     entity_type: str
-    attributes: Dict[str, Any]
+    attributes: Dict[str, Any] = field(default_factory=dict)
     uuid: Optional[str] = None
     summary: Optional[str] = None
 
 
 @dataclass
 class SearchResult:
-    """Result from semantic search."""
+    """A semantic-search result."""
     content: str
     score: float
     source: str
-    metadata: Dict[str, Any]
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class _InMemoryBackend:
+    """
+    Drop-in OMPA backend that keeps everything in process memory plus an
+    optional JSONL event log on disk.
+
+    Suitable for tests and light deployments. Not durable across crashes
+    unless `vault_path` is set.
+    """
+
+    def __init__(self, vault_path: Optional[Path] = None):
+        self.vault_path = vault_path
+        self._facts: List[Tuple[str, str, str, str]] = []  # (subject, predicate, object, source)
+        self._events: List[Dict[str, Any]] = []
+        self._lock = threading.Lock()
+
+        if self.vault_path is not None:
+            self.vault_path.mkdir(parents=True, exist_ok=True)
+            self._event_log_path: Optional[Path] = self.vault_path / "events.jsonl"
+        else:
+            self._event_log_path = None
+
+    # KG methods ---------------------------------------------------------
+    def kg_add(self, subject: str, predicate: str, object: str, source: str = "") -> None:
+        with self._lock:
+            self._facts.append((subject, predicate, object, source))
+
+    def kg_query(self, subject: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [
+                {"subject": s, "predicate": p, "object": o, "source": src}
+                for (s, p, o, src) in self._facts
+                if s == subject
+            ]
+
+    # Search -------------------------------------------------------------
+    def search(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Naive token-overlap search over recorded events."""
+        tokens = {t.lower() for t in query.split() if t}
+        scored: List[Tuple[float, Dict[str, Any]]] = []
+        with self._lock:
+            for ev in self._events:
+                text = (ev.get("description", "") + " " + ev.get("type", "")).lower()
+                overlap = sum(1 for t in tokens if t in text)
+                if overlap:
+                    scored.append((float(overlap), ev))
+
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return [
+            {
+                "content": ev.get("description", ""),
+                "score": score,
+                "source": ev.get("source", "sandfish"),
+                "metadata": ev.get("metadata", {}),
+            }
+            for score, ev in scored[:limit]
+        ]
+
+    # Events -------------------------------------------------------------
+    def record_event(self, event: Dict[str, Any]) -> None:
+        with self._lock:
+            self._events.append(event)
+            if self._event_log_path is not None:
+                try:
+                    with self._event_log_path.open("a", encoding="utf-8") as fp:
+                        fp.write(json.dumps(event, default=str) + "\n")
+                except OSError as exc:
+                    logger.warning("Failed to persist event log: %s", exc)
+
+    def get_events(self, limit: int = 100) -> List[Dict[str, Any]]:
+        with self._lock:
+            return list(self._events[-limit:])
+
+    # Lifecycle ----------------------------------------------------------
+    def session_start(self) -> Dict[str, Any]:
+        return {"success": True, "tokens_hint": 0}
+
+    def stop(self) -> None:
+        return None
 
 
 class OMPAMemoryAdapter:
     """
-    Drop-in replacement for Zep Cloud memory.
-    
-    Uses OMPA for:
-    - Semantic search (local embeddings)
-    - Knowledge graph (SQLite)
-    - Entity management
-    - Session history
+    Memory adapter backed by OMPA when available, in-memory otherwise.
+
+    All public methods are safe to call even if OMPA is not installed.
     """
-    
+
     def __init__(self, vault_path: str):
-        """
-        Initialize OMPA adapter.
-        
-        Args:
-            vault_path: Path to OMPA vault directory
-        """
-        if not HAS_Ompa:
-            raise ImportError(
-                "OMPA not installed. "
-                "Install with: pip install 'ompa[semantic]'"
-            )
-        
         self.vault_path = Path(vault_path)
-        self.ompa = Ompa(vault_path=str(self.vault_path))
         self.session_active = False
-        
+
+        if HAS_OMPA:
+            try:
+                # Real OMPA SDK; treat it as the backend.
+                self.backend: Any = Ompa(vault_path=str(self.vault_path))
+                self._using_ompa = True
+            except Exception as exc:
+                logger.warning(
+                    "OMPA installed but failed to initialize (%s); "
+                    "falling back to in-memory backend.",
+                    exc,
+                )
+                self.backend = _InMemoryBackend(self.vault_path)
+                self._using_ompa = False
+        else:
+            self.backend = _InMemoryBackend(self.vault_path)
+            self._using_ompa = False
+
+        # Local event mirror — used regardless of backend so
+        # get_simulation_history is always functional.
+        self._event_mirror: List[Dict[str, Any]] = []
+
+    # ----- Session -----
+
     def start_session(self) -> Dict[str, Any]:
-        """Start a new simulation session."""
-        result = self.ompa.session_start()
+        result = self.backend.session_start()
         self.session_active = True
         return {
-            'success': result.success,
-            'context_tokens': result.tokens_hint,
-            'vault_stats': self._get_vault_stats()
+            "success": getattr(result, "success", result.get("success", True) if isinstance(result, dict) else True),
+            "context_tokens": getattr(result, "tokens_hint", result.get("tokens_hint", 0) if isinstance(result, dict) else 0),
+            "vault_stats": self._get_vault_stats(),
+            "backend": "ompa" if self._using_ompa else "in_memory",
         }
-    
+
     def end_session(self) -> None:
-        """End current session."""
-        self.ompa.stop()
-        self.session_active = False
-    
+        try:
+            self.backend.stop()
+        finally:
+            self.session_active = False
+
+    # ----- Search -----
+
     def search(self, query: str, limit: int = 10) -> List[SearchResult]:
-        """
-        Semantic search across vault content.
-        
-        Args:
-            query: Search query
-            limit: Maximum results
-            
-        Returns:
-            List of search results with similarity scores
-        """
         if not self.session_active:
             self.start_session()
-        
-        # Use OMPA semantic search
-        results = self.ompa.search(query, limit=limit)
-        
+
+        try:
+            raw = self.backend.search(query, limit=limit) or []
+        except Exception as exc:
+            logger.warning("search() failed: %s", exc)
+            raw = []
+
         return [
             SearchResult(
-                content=r.get('content', ''),
-                score=r.get('score', 0.0),
-                source=r.get('source', 'unknown'),
-                metadata=r.get('metadata', {})
+                content=r.get("content", ""),
+                score=float(r.get("score", 0.0)),
+                source=r.get("source", "unknown"),
+                metadata=r.get("metadata", {}),
             )
-            for r in results
+            for r in raw
         ]
-    
-    def add_entity(self, name: str, entity_type: str, 
-                   attributes: Dict[str, Any] = None) -> Entity:
-        """
-        Add entity to knowledge graph.
-        
-        Args:
-            name: Entity name
-            entity_type: Type of entity (Person, Organization, etc.)
-            attributes: Additional attributes
-            
-        Returns:
-            Created entity
-        """
-        if attributes is None:
-            attributes = {}
-        
-        # Add to OMPA knowledge graph
-        self.ompa.kg_add(
-            subject=name,
-            predicate="is_a",
-            object=entity_type,
-            source="sandfish/simulation"
-        )
-        
-        # Add attributes as separate facts
-        for key, value in attributes.items():
-            self.ompa.kg_add(
-                subject=name,
-                predicate=key,
-                object=str(value),
-                source="sandfish/simulation"
+
+    # ----- Knowledge graph -----
+
+    def add_entity(
+        self,
+        name: str,
+        entity_type: str,
+        attributes: Optional[Dict[str, Any]] = None,
+    ) -> Entity:
+        attributes = attributes or {}
+
+        try:
+            self.backend.kg_add(
+                subject=name, predicate="is_a", object=entity_type, source="sandfish/simulation"
             )
-        
-        return Entity(
-            name=name,
-            entity_type=entity_type,
-            attributes=attributes
-        )
-    
+            for key, value in attributes.items():
+                self.backend.kg_add(
+                    subject=name,
+                    predicate=key,
+                    object=str(value),
+                    source="sandfish/simulation",
+                )
+        except Exception as exc:
+            logger.warning("add_entity(%s) failed: %s", name, exc)
+
+        return Entity(name=name, entity_type=entity_type, attributes=attributes)
+
     def get_entity(self, name: str) -> Optional[Entity]:
-        """
-        Retrieve entity from knowledge graph.
-        
-        Args:
-            name: Entity name
-            
-        Returns:
-            Entity if found, None otherwise
-        """
-        facts = self.ompa.kg_query(name)
-        
+        try:
+            facts = self.backend.kg_query(name) or []
+        except Exception as exc:
+            logger.warning("get_entity(%s) failed: %s", name, exc)
+            return None
+
         if not facts:
             return None
-        
-        # Parse facts to reconstruct entity
+
         entity_type = "Unknown"
-        attributes = {}
-        
+        attributes: Dict[str, Any] = {}
         for fact in facts:
-            predicate = fact.get('predicate', '')
-            object_val = fact.get('object', '')
-            
+            predicate = fact.get("predicate", "")
+            object_val = fact.get("object", "")
             if predicate == "is_a":
                 entity_type = object_val
             else:
                 attributes[predicate] = object_val
-        
-        return Entity(
-            name=name,
-            entity_type=entity_type,
-            attributes=attributes
-        )
-    
-    def get_related_entities(self, name: str, 
-                             relation: Optional[str] = None) -> List[Entity]:
-        """
-        Find entities related to given entity.
-        
-        Args:
-            name: Entity name
-            relation: Optional relation type filter
-            
-        Returns:
-            List of related entities
-        """
-        # Query knowledge graph for relationships
-        # This is a simplified version - full implementation would
-        # traverse the graph more thoroughly
-        
-        facts = self.ompa.kg_query(name)
-        related = []
-        
+
+        return Entity(name=name, entity_type=entity_type, attributes=attributes)
+
+    def get_related_entities(
+        self, name: str, relation: Optional[str] = None
+    ) -> List[Entity]:
+        try:
+            facts = self.backend.kg_query(name) or []
+        except Exception as exc:
+            logger.warning("get_related_entities(%s) failed: %s", name, exc)
+            return []
+
+        related: List[Entity] = []
         for fact in facts:
-            if relation and fact.get('predicate') != relation:
+            if relation and fact.get("predicate") != relation:
                 continue
-                
-            obj = fact.get('object', '')
-            # If object is another entity, fetch it
-            if self._is_entity_name(obj):
+            obj = fact.get("object", "")
+            if self._looks_like_entity(obj):
                 entity = self.get_entity(obj)
                 if entity:
                     related.append(entity)
-        
         return related
-    
-    def record_event(self, event_type: str, description: str,
-                     metadata: Dict[str, Any] = None) -> None:
-        """
-        Record simulation event.
-        
-        Args:
-            event_type: Type of event (DECISION, ACTION, MILESTONE)
-            description: Event description
-            metadata: Additional metadata
-        """
-        # Classify and store in appropriate vault location
-        classification = self.ompa.classify(description)
-        
-        # Write to vault based on classification
-        note_data = {
-            'type': event_type,
-            'description': description,
-            'metadata': metadata or {},
-            'classification': classification.message_type.value
+
+    # ----- Events -----
+
+    def record_event(
+        self,
+        event_type: str,
+        description: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Record an event so it's queryable via search() and history()."""
+        event = {
+            "id": uuid.uuid4().hex,
+            "type": event_type,
+            "description": description,
+            "metadata": metadata or {},
+            "timestamp": _utcnow().isoformat(),
+            "source": "sandfish/simulation",
         }
-        
-        # OMPA will auto-route to appropriate vault section
-        # based on classification
-    
-    def get_simulation_history(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """
-        Retrieve simulation history.
-        
-        Args:
-            limit: Maximum events to return
-            
-        Returns:
-            List of historical events
-        """
-        # Query knowledge graph for simulation events
-        # This would typically search for facts with source="sandfish/simulation"
-        
-        # For now, return empty - full implementation would
-        # query the temporal knowledge graph
-        return []
-    
-    def _get_vault_stats(self) -> Dict[str, Any]:
-        """Get vault statistics."""
+
+        # Always mirror locally — this is the source of truth for history().
+        self._event_mirror.append(event)
+
+        # Best-effort write to backend so searches can find it.
         try:
-            # Count files in vault
-            brain_files = list((self.vault_path / 'brain').glob('*.md'))
-            
+            recorder = getattr(self.backend, "record_event", None)
+            if callable(recorder):
+                recorder(event)
+            else:
+                # Fall back to writing as KG facts on backends without record_event.
+                self.backend.kg_add(
+                    subject=event["id"],
+                    predicate="is_a",
+                    object="Event",
+                    source="sandfish/simulation",
+                )
+                self.backend.kg_add(
+                    subject=event["id"],
+                    predicate="event_type",
+                    object=event_type,
+                    source="sandfish/simulation",
+                )
+                self.backend.kg_add(
+                    subject=event["id"],
+                    predicate="description",
+                    object=description,
+                    source="sandfish/simulation",
+                )
+        except Exception as exc:
+            logger.warning("record_event backend write failed: %s", exc)
+
+    def get_simulation_history(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Retrieve recent events recorded via record_event()."""
+        if limit <= 0:
+            return []
+        return list(self._event_mirror[-limit:])
+
+    # ----- Internal -----
+
+    def _get_vault_stats(self) -> Dict[str, Any]:
+        try:
+            brain_files = list((self.vault_path / "brain").glob("*.md")) if self.vault_path.exists() else []
             return {
-                'brain_notes': len(brain_files),
-                'vault_path': str(self.vault_path)
+                "brain_notes": len(brain_files),
+                "vault_path": str(self.vault_path),
+                "events_recorded": len(self._event_mirror),
             }
-        except Exception:
-            return {'error': 'Could not read vault stats'}
-    
-    def _is_entity_name(self, text: str) -> bool:
-        """Heuristic to check if text is an entity name."""
-        # Simple heuristic - could be improved
-        return len(text) < 50 and text[0].isupper()
+        except Exception as exc:
+            return {"error": f"Could not read vault stats: {exc}"}
+
+    @staticmethod
+    def _looks_like_entity(text: str) -> bool:
+        """Heuristic: short, capitalized strings are probably entity names."""
+        if not text or len(text) > 80:
+            return False
+        return text[:1].isupper() and not text.isnumeric()
 
 
-# Convenience functions for SandFish integration
+# Factory + utilities ---------------------------------------------------
 
 def create_memory_adapter(vault_path: str) -> OMPAMemoryAdapter:
-    """Factory function to create memory adapter."""
+    """Convenience factory."""
     return OMPAMemoryAdapter(vault_path)
 
 
-def migrate_from_zep(zep_data: List[Dict], 
-                     adapter: OMPAMemoryAdapter) -> int:
+def migrate_from_external(
+    records: List[Dict[str, Any]], adapter: OMPAMemoryAdapter
+) -> int:
     """
-    Migrate data from Zep Cloud to OMPA.
-    
-    Args:
-        zep_data: Data exported from Zep
-        adapter: Initialized OMPA adapter
-        
-    Returns:
-        Number of entities migrated
+    Import entities from an external source into the OMPA-backed adapter.
+
+    Each record should be a dict with optional `name`, `type`, `attributes` keys.
+    Returns the number of entities written.
     """
     count = 0
-    
-    for item in zep_data:
-        name = item.get('name', 'Unknown')
-        entity_type = item.get('type', 'Entity')
-        attributes = item.get('attributes', {})
-        
-        adapter.add_entity(name, entity_type, attributes)
+    for item in records:
+        name = item.get("name")
+        if not name:
+            continue
+        adapter.add_entity(
+            name=name,
+            entity_type=item.get("type", "Entity"),
+            attributes=item.get("attributes", {}),
+        )
         count += 1
-    
     return count

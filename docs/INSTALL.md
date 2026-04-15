@@ -1,210 +1,112 @@
 # Installation Guide
 
-SandFish is platform-agnostic and runs on any system with Python 3.10+.
+SandFish runs on any platform with Python 3.10 or newer. It has no published
+PyPI release yet, so install from a local clone.
 
-## Quick Install
-
-```bash
-pip install sandfish
-```
-
-## Platform-Specific Instructions
-
-### Linux (Ubuntu/Debian)
+## From source
 
 ```bash
-# Install Python 3.10+ if needed
-sudo apt update
-sudo apt install python3.11 python3.11-pip python3.11-venv
-
-# Create virtual environment
-python3.11 -m venv sandfish-env
-source sandfish-env/bin/activate
-
-# Install SandFish
-pip install sandfish
-
-# Run
-sandfish --version
-```
-
-### macOS
-
-```bash
-# Using Homebrew
-brew install python@3.11
-
-# Create virtual environment
-python3.11 -m venv sandfish-env
-source sandfish-env/bin/activate
-
-# Install SandFish
-pip install sandfish
-
-# Run
-sandfish --version
-```
-
-### Windows (Native)
-
-```powershell
-# Install Python 3.10+ from python.org
-# Create virtual environment
-python -m venv sandfish-env
-sandfish-env\Scripts\activate
-
-# Install SandFish
-pip install sandfish
-
-# Run
-sandfish --version
-```
-
-### Windows (WSL2) - Recommended
-
-```bash
-# In WSL2 terminal
-sudo apt update
-sudo apt install python3.11 python3.11-pip python3.11-venv
-
-python3.11 -m venv sandfish-env
-source sandfish-env/bin/activate
-pip install sandfish
-```
-
-### Docker (All Platforms)
-
-```bash
-# Pull from Docker Hub (when published)
-docker pull jmiaie/sandfish:latest
-
-# Or build locally
-git clone https://github.com/jmiaie/sandfish.git
+git clone <this-repo>
 cd sandfish
-docker build -t sandfish .
+python -m venv .venv
+# Linux/macOS
+source .venv/bin/activate
+# Windows (cmd)
+.venv\Scripts\activate.bat
+# Windows (PowerShell)
+.venv\Scripts\Activate.ps1
 
-# Run
-docker run -p 8000:8000 sandfish
-
-# Or use docker-compose
-docker-compose up
+pip install .
+# For tests, linting, and the security auditor extras:
+pip install -e '.[dev]'
 ```
 
-### Raspberry Pi / ARM64
+Verify the CLI is on your path:
 
 ```bash
-# Install dependencies
-sudo apt update
-sudo apt install python3-pip python3-venv libsqlite3-dev
-
-# Create virtual environment
-python3 -m venv sandfish-env
-source sandfish-env/bin/activate
-
-# Install SandFish
-pip install sandfish
-
-# Note: First install may take longer on ARM due to compilation
-```
-
-## Cloud Deployment
-
-### AWS EC2
-
-```bash
-# User data script for EC2
-#!/bin/bash
-apt update
-apt install -y docker.io
-docker run -d -p 80:8000 jmiaie/sandfish:latest
-```
-
-### Google Cloud Run
-
-```yaml
-# service.yaml
-apiVersion: serving.knative.dev/v1
-kind: Service
-metadata:
-  name: sandfish
-spec:
-  template:
-    spec:
-      containers:
-      - image: jmiaie/sandfish:latest
-        ports:
-        - containerPort: 8000
-```
-
-### Kubernetes
-
-```bash
-# Apply deployment
-kubectl apply -f k8s/deployment.yaml
-kubectl apply -f k8s/service.yaml
-```
-
-## Development Install
-
-```bash
-git clone https://github.com/jmiaie/sandfish.git
-cd sandfish
-pip install -e ".[dev]"
-```
-
-## Verification
-
-```bash
-# Check installation
 sandfish --version
-
-# Run tests
-pytest tests/
-
-# Run security audit
-sandfish security-audit
-
-# Start API
-sandfish api --port 8000
 ```
+
+## Platform notes
+
+- **Linux (Debian/Ubuntu):** Install Python with `sudo apt install python3
+  python3-venv python3-pip`. No extra system libraries are required for the
+  runtime; the build image uses `libsqlite3-dev`/`libsqlite3-0` if you build
+  the Docker image locally.
+- **macOS:** `brew install python@3.11`, then the `pip install .` flow above.
+- **Windows:** Install Python from <https://www.python.org/downloads/>, make
+  sure "Add python.exe to PATH" is checked, then use the PowerShell
+  activation shown above.
+- **WSL2:** Follow the Linux instructions inside your WSL distro.
+
+## Docker
+
+The repo ships a two-stage Dockerfile and a Compose file.
+
+```bash
+# build the image
+docker compose build
+
+# run the HTTP API on port 8000
+docker compose up
+
+# run a long-form simulation alongside the API server
+docker compose --profile orchestrator up
+```
+
+The container exposes port 8000 and runs as a non-root `sandfish` user. Mount
+a volume at `/app/vault` to keep vault data across restarts.
+
+No image is published to a public registry. Build locally or push to your own
+registry if you want to deploy it elsewhere.
+
+## Running it
+
+```bash
+# a small simulation, no persistence
+sandfish orchestrator --rounds 10 --agents 5
+
+# the HTTP API
+sandfish api --port 8000 --vault ./sandfish_vault
+```
+
+See the main [README](../README.md) for the full CLI and configuration
+reference.
 
 ## Troubleshooting
 
-### OMPA Not Found
+**`YAML config requires PyYAML`**
+
+The CLI loads JSON natively; for YAML configs you need `pip install pyyaml`.
+
+**`ompa` failed to install**
 
 ```bash
-pip install 'ompa[semantic]'
+pip install ompa
 ```
 
-### Permission Denied (Linux/macOS)
+If the default install does not resolve extras your simulation needs, consult
+the OMPA project for feature flags.
 
-```bash
-# Use virtual environment instead of system Python
-python3 -m venv myenv
-source myenv/bin/activate
-pip install sandfish
-```
+**Windows path issues with `--vault`**
 
-### Windows Path Issues
+Use forward slashes or quote the path:
 
 ```powershell
-# Use forward slashes or double backslashes
-sandfish orchestrator --vault "C:/Users/Name/vault"
-# or
-sandfish orchestrator --vault "C:\\Users\\Name\\vault"
+sandfish orchestrator --vault "C:/Users/Name/sandfish_vault"
 ```
 
-## System Requirements
+## System requirements
 
-| Resource | Minimum | Recommended |
-|----------|---------|-------------|
-| Python | 3.10 | 3.11+ |
-| RAM | 512 MB | 2 GB |
-| Disk | 100 MB | 1 GB (for vault) |
-| CPU | 1 core | 2+ cores |
+SandFish is light; requirements scale with simulation size.
 
-## Next Steps
+| Resource | Suggested minimum |
+| --- | --- |
+| Python | 3.10 |
+| RAM | 512 MB for small simulations |
+| Disk | 100 MB plus vault size |
+| CPU | Any modern x86_64 / arm64 core |
 
-- [Quick Start Guide](QUICKSTART.md)
-- [API Documentation](API.md)
-- [Configuration Reference](CONFIG.md)
+For larger simulations, see `benchmarks/run_all.py`, which exercises startup,
+agent creation, full-simulation throughput, and (if `psutil` is installed)
+process memory.

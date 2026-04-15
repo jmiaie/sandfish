@@ -1,6 +1,7 @@
 # Git
 .git
 .gitignore
+.gitattributes
 
 # Python
 __pycache__
@@ -26,33 +27,47 @@ wheels/
 
 # Virtual environments
 venv/
-ENV/
+.venv/
 env/
-.venv
+ENV/
 
-# IDE
-.vscode
-.idea
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
 *.swp
 *.swo
-*~
 
 # Testing
-.pytest_cache
+.pytest_cache/
 .coverage
 htmlcov/
-.tox
+.tox/
+.mypy_cache/
+.ruff_cache/
 
-# Vault data (mount as volume)
+# Vault data
+sandfish_vault/
 vault/
 *.db
 *.sqlite
 
-# Documentation
-docs/
-*.md
+# Secrets / env
+.env
+.env.*
+secrets.yaml
+secrets.yml
+*.pem
+*.key
 
-# CI/CD
+# CI / VCS metadata
 .github/
 .gitlab-ci.yml
 .travis.yml
+
+# Docs (not needed in runtime image)
+docs/
+
+# Test suite (not needed in runtime image)
+tests/
+benchmarks/

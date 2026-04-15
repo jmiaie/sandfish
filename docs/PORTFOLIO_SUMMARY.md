@@ -1,118 +1,84 @@
-# SandFish - Portfolio Summary
+# SandFish — Portfolio Summary
 
-## Professional Overview
+## Overview
 
-**SandFish** is a production-grade, open-source multi-agent swarm intelligence platform that I architected and developed from scratch. Built as a clean-room implementation with zero foreign dependencies, it addresses critical security and cost gaps in existing solutions.
+**SandFish** is a local-first multi-agent simulation engine built from scratch
+in Python 3.10+. It runs round-based simulations of heterogeneous agents,
+persists events and entities to a local OMPA vault, and exposes a FastAPI
+HTTP layer with optional API-key auth and sliding-window rate limiting.
 
----
+It is a small, transparent tool aimed at research and experimentation rather
+than production workloads.
 
-## Key Technical Achievements
+## Technical scope
 
-### Architecture & Design
-- **Modular microservices architecture** with FastAPI REST/WebSocket APIs
-- **Async-first design** using Python asyncio for high concurrency
-- **Clean-room implementation** - 100% auditable code, no black-box dependencies
-- **Platform-agnostic** - runs on Linux, macOS, Windows, Docker, and cloud platforms
+### Architecture
 
-### Performance Engineering
-- **5x faster** than comparable solutions (10ms vs 50ms API latency)
-- **37% lower memory footprint** (0.76MB vs 1.2MB per agent)
-- **1000+ agents/second** throughput on standard hardware
-- **Linear scalability** to 1000+ concurrent agents
+- `SwarmOrchestrator` — round-based execution with pause / resume / stop
+  semantics, per-simulation async locks, and pluggable event callbacks.
+- Agent system — `BaseAgent` with pluggable subclasses (`DefaultAgent`,
+  `InfluencerAgent`, `LurkerAgent`) and a factory for registering new
+  types.
+- `OMPAMemoryAdapter` — thin wrapper over an OMPA vault, unified surface for
+  events, entities, and retrieval.
+- FastAPI HTTP layer — REST + server-sent events; optional auth and rate
+  limiting.
+- CLI — `sandfish orchestrator`, `sandfish api`, `sandfish security-audit`.
 
-### Security-First Development
-- **Comprehensive security audit framework** with automated vulnerability scanning
-- **Zero hardcoded secrets** - proper environment-based configuration
-- **Dependency auditing** integrated into CI/CD pipeline
-- **Docker security hardening** - non-root user, minimal attack surface
+### Engineering practices applied
 
-### Cost Optimization
-- **$0 operational cost** vs $150+/month for cloud-dependent alternatives
-- **Local-first architecture** - no mandatory external API dependencies
-- **SQLite-based persistence** - no database licensing costs
+- `async`/`await` throughout the orchestrator and agent loop.
+- Typed data classes for configuration and results.
+- Bounded `deque` for agent action history to prevent unbounded growth.
+- pytest + pytest-asyncio test suite covering agents, orchestrator control
+  flow, edge cases, and integration against a real (temporary) vault.
+- Static security auditor with per-severity exit codes, driven by bandit
+  when available.
+- Docker build as a two-stage image running as a non-root user, with a
+  `/health` probe.
 
----
+## Tech stack
 
-## Technologies Used
+| Category | Tools |
+| --- | --- |
+| Language | Python 3.10+ |
+| HTTP | FastAPI, uvicorn |
+| Validation | pydantic v2 |
+| Storage | OMPA vault (SQLite-backed) |
+| Tests | pytest, pytest-asyncio |
+| Security | bandit, safety |
+| Packaging | hatchling |
+| Container | Docker, Docker Compose |
 
-| Category | Technologies |
-|----------|-------------|
-| **Language** | Python 3.10+ |
-| **Web Framework** | FastAPI, Uvicorn |
-| **Data Validation** | Pydantic v2 |
-| **Memory/Storage** | OMPA (custom framework), SQLite |
-| **Testing** | pytest, pytest-asyncio |
-| **Security** | bandit, safety, ruff |
-| **Packaging** | hatchling, twine |
-| **Containerization** | Docker, docker-compose |
-| **Documentation** | Markdown, GitHub Pages |
+## What I set out to build
 
----
+A transparent, local-first sandbox for multi-agent simulations with:
 
-## Project Metrics
+1. No mandatory external services at runtime.
+2. A small, readable codebase that someone can audit end-to-end.
+3. A CLI and HTTP API that work the same way against the same engine.
+4. Clear pause / resume / stop semantics so a long run can be stepped
+   through rather than restarted.
 
-| Metric | Value |
-|--------|-------|
-| **Total Lines of Code** | ~3,500 |
-| **Test Coverage** | 85%+ |
-| **Documentation Pages** | 10+ |
-| **GitHub Stars** | Growing |
-| **PyPI Downloads** | Available |
-| **Docker Pulls** | Available |
+## What I would not claim
 
----
+- That it outperforms any specific alternative — no controlled benchmark
+  comparison has been run for this repository.
+- That it is production-ready. It is alpha-quality and single-process.
+- That it provides hardened multi-tenant isolation. It does not.
 
-## Professional Impact
+## Current status
 
-### Problem Solved
-Identified critical security vulnerabilities and cost inefficiencies in existing multi-agent platforms (foreign code dependencies, mandatory $150+/month cloud costs, unauditable black-box components).
-
-### Solution Delivered
-Built a clean-room alternative from scratch with:
-- Zero security vulnerabilities (audited)
-- Zero mandatory cloud costs
-- 5x performance improvement
-- Full code auditability
-
-### Business Value
-- **Cost savings**: $1,800+/year per deployment
-- **Risk reduction**: Eliminated foreign code attack surface
-- **Performance gain**: 5x throughput improvement
-- **Vendor independence**: No platform lock-in
-
----
+- Version 0.1.0; MIT licensed.
+- Test suite runs green on Windows and Linux (54 tests, including
+  async + integration).
+- Not yet published to PyPI; install from source.
+- No published Docker image; the Dockerfile and Compose file build locally.
 
 ## Links
 
-| Resource | URL |
-|----------|-----|
-| **GitHub Repository** | https://github.com/jmiaie/sandfish |
-| **PyPI Package** | https://pypi.org/project/sandfish/ |
-| **Documentation** | https://github.com/jmiaie/sandfish/tree/main/docs |
-| **White Paper** | https://github.com/jmiaie/sandfish/blob/main/docs/WHITEPAPER.md |
-| **Docker Hub** | `docker pull jmiaie/sandfish` |
-
----
-
-## Installation
-
-```bash
-pip install sandfish
-```
-
----
-
-## Recognition
-
-- **Featured on PyPI** as trending package
-- **Security-audited** with zero vulnerabilities
-- **Production-ready** from day one
-- **Open source** (MIT License)
-
----
-
-**Contact**: jarv@micap.ai | https://github.com/jmiaie
-
----
-
-*Built with expertise in software engineering, AI systems, and security architecture.*
+- Source: this repository.
+- License: [MIT](../LICENSE)
+- Architecture write-up: [WHITEPAPER.md](WHITEPAPER.md)
+- Install notes: [INSTALL.md](INSTALL.md)
+- Performance notes: [PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md)

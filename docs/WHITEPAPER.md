@@ -1,335 +1,179 @@
-# SandFish: A Clean-Room Multi-Agent Swarm Intelligence System
+# SandFish: A Local-First Multi-Agent Simulation Engine
 
-## White Paper
-
-**Version**: 1.0  
-**Date**: April 12, 2026  
-**Author**: Jarv (Micap AI)  
-**Contact**: jarv@micap.ai
-
----
+**Version**: 0.1 (draft)
+**Status**: Early-stage research / simulation tool — not production software
+**License**: MIT
 
 ## Abstract
 
-SandFish is a production-grade, open-source multi-agent swarm intelligence platform designed for prediction markets, scenario planning, and collective intelligence applications. Built as a clean-room implementation with zero foreign dependencies, SandFish addresses critical security and cost concerns present in existing solutions. By leveraging the OMPA (Obsidian-Memory-Palace-Agnostic) framework for local-first memory management, SandFish eliminates mandatory cloud service dependencies while maintaining enterprise-grade performance.
+SandFish is a small multi-agent simulation engine backed by a local OMPA
+vault. It runs round-based simulations of heterogeneous agents, exposes a
+FastAPI HTTP layer, and persists events and entities to the vault for later
+analysis. It is explicitly scoped as a local, research-style tool: the
+orchestrator is single-process, the API is minimally hardened, and there is
+no distributed mode.
 
-**Key Contributions**:
-- Zero cloud lock-in architecture (saves $150+/month vs. alternatives)
-- Security-first design with comprehensive audit capabilities
-- Platform-agnostic deployment (Linux, macOS, Windows, Docker, cloud)
-- Sub-20ms API latency with 1000+ agent throughput
-- 100% auditable codebase with no foreign code dependencies
+This paper describes the architecture, the simulation model, and the design
+trade-offs. It deliberately avoids performance claims that have not been
+reproduced.
 
----
+## 1. Goals and non-goals
 
-## 1. Introduction
+Goals:
 
-### 1.1 Background
+- Give a reproducible, local sandbox for experimenting with small populations
+  of interacting agents.
+- Keep all state in one place (the OMPA vault) so a run can be inspected
+  after the fact.
+- Make it easy to add new agent types by subclassing `BaseAgent` and
+  registering them with the factory.
+- Ship a minimal HTTP API that a UI or notebook can poll during a run.
 
-Multi-agent systems have emerged as a powerful paradigm for modeling complex social and economic phenomena. Applications range from prediction market simulation to policy impact assessment and automated trading strategy validation. However, existing solutions suffer from critical limitations:
+Non-goals:
 
-- **Foreign code dependencies**: Many platforms incorporate unaudited code from unknown sources
-- **Mandatory cloud services**: Solutions like MiroFish require Zep Cloud ($150+/month)
-- **Security vulnerabilities**: Development-grade servers, hardcoded secrets, insufficient audit trails
-- **Platform lock-in**: Tight coupling to specific vendors or architectures
-
-### 1.2 Motivation
-
-The need for a clean, auditable, cost-effective multi-agent platform motivated the creation of SandFish. Our design goals were:
-
-1. **Security-first**: Every component auditable, no black-box dependencies
-2. **Zero token burn**: No mandatory external API costs
-3. **Platform independence**: Run anywhere Python runs
-4. **Production-grade**: Not a prototype—ready for enterprise deployment
-5. **Open source**: Full transparency, community-driven improvement
-
-### 1.3 Related Work
-
-| Platform | Cloud Cost | Security Audit | Code Provenance | Performance |
-|----------|------------|----------------|-----------------|-------------|
-| MiroFish | $150+/mo | ❌ | Foreign (Chinese) | Moderate |
-| AutoGen | Variable | Partial | Microsoft | Good |
-| CrewAI | Variable | Partial | Open | Good |
-| **SandFish** | **$0** | **✅ Full** | **Clean-room** | **Excellent** |
-
----
+- High-scale or distributed simulation.
+- Hosting untrusted workloads or multi-tenant isolation.
+- Beating any specific alternative on benchmarks. SandFish is not
+  benchmarked against other frameworks in this repo; users who need that
+  should run their own comparisons on their own hardware.
 
 ## 2. Architecture
 
-### 2.1 System Overview
-
-SandFish follows a modular, layered architecture:
-
 ```
-┌─────────────────────────────────────────┐
-│           API Layer (FastAPI)           │
-│  REST Endpoints | WebSocket | Security  │
-├─────────────────────────────────────────┤
-│         Core Simulation Engine          │
-│  SwarmOrchestrator | Simulation Runner  │
-├─────────────────────────────────────────┤
-│           Agent Definitions             │
-│  BaseAgent | Specialized Types | Factory│
-├─────────────────────────────────────────┤
-│         Memory & Persistence            │
-│  OMPA Adapter | Knowledge Graph | Vault │
-├─────────────────────────────────────────┤
-│           Security Layer                │
-│  Audit | Sandbox | Crypto | Logging     │
-└─────────────────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│           API (FastAPI + uvicorn)            │
+│  REST endpoints · SSE event stream · auth    │
+├──────────────────────────────────────────────┤
+│              SwarmOrchestrator               │
+│  Round loop · pause/resume/stop · callbacks  │
+├──────────────────────────────────────────────┤
+│                  Agents                      │
+│  Default · Influencer · Lurker · custom      │
+├──────────────────────────────────────────────┤
+│              OMPAMemoryAdapter               │
+│  Events · entities · relationships · search  │
+└──────────────────────────────────────────────┘
 ```
 
-### 2.2 Key Components
+### 2.1 Orchestrator
 
-#### 2.2.1 SwarmOrchestrator
+`SwarmOrchestrator` owns the simulation lifecycle: creating agents,
+executing one round at a time, dispatching events to registered callbacks,
+and exposing pause/resume/stop controls. Each simulation has a per-sim
+`asyncio.Lock` so that duplicate `run_simulation` calls do not race.
 
-The central simulation controller manages:
-- Distributed agent lifecycle
-- Round-based execution
-- Checkpoint/resume capability
-- Real-time event streaming
+A round:
 
-**Performance**: 100 rounds/sec with 100 agents (4 vCPU)
+1. Give each agent the current peer list.
+2. Ask every agent for its next action concurrently (`asyncio.gather`).
+3. Apply each action sequentially so shared state mutations are
+   deterministic.
+4. Emit a `round_complete` event and yield, then re-read status to support
+   cooperative pause/stop.
 
-#### 2.2.2 Agent System
+### 2.2 Agents
 
-Hierarchical agent architecture:
-- `BaseAgent`: Abstract foundation with personality modeling
-- `DefaultAgent`: Balanced behavior profile
-- `InfluencerAgent`: Content-creation focused
-- `LurkerAgent`: Observation-focused
-- Extensible factory pattern for custom types
+`BaseAgent` owns an `AgentProfile` (traits, goals, backstory) and an
+`AgentState` (energy, mood, action history bounded by a deque). Subclasses
+override `decide_action`:
 
-#### 2.2.3 OMPA Integration
+- `DefaultAgent` — trait-weighted random choice.
+- `InfluencerAgent` — biased toward content creation.
+- `LurkerAgent` — biased toward passive actions; forces rest at low energy.
 
-The OMPA (Obsidian-Memory-Palace-Agnostic) adapter provides:
-- Local semantic search (no API calls)
-- SQLite-based knowledge graph
-- Temporal fact storage with provenance
-- Zero external dependencies
+New agent types can be registered via `register_agent_type(name, cls)` and
+then created with `create_agent(name, ...)`.
 
-**Cost Savings**: $150+/month vs. Zep Cloud
+### 2.3 Memory
 
-#### 2.2.4 Security Framework
+`OMPAMemoryAdapter` is a thin wrapper over an OMPA vault with three main
+surfaces:
 
-Comprehensive security capabilities:
-- Automated vulnerability scanning (bandit, safety)
-- Code pattern analysis (eval/exec detection)
-- Dependency auditing
-- File permission validation
-- Runtime sandboxing
+- `record_event(event_type, description, metadata)` for orchestrator and
+  agent lifecycle events.
+- `add_entity` / `get_related_entities` for the agent knowledge graph.
+- `search` for retrieval during agent decision-making.
 
-### 2.3 Data Flow
+All data is local to the vault directory; there is no mandatory remote
+service.
 
-```
-User Request → API Layer → Orchestrator → Agents
-                                      ↓
-                              OMPA Adapter
-                                      ↓
-                              Local Vault (SQLite)
-```
+### 2.4 API
 
-All data remains local unless explicitly configured otherwise.
+`sandfish api` launches a FastAPI app with:
 
----
+- `/health` — unauthenticated liveness probe.
+- `/api/simulations/...` — CRUD and control endpoints for simulations.
+- `/api/events` — server-sent events stream for orchestrator events.
 
-## 3. Security Analysis
+If `SANDFISH_API_KEY` is set, every `/api/*` request must carry a matching
+`X-API-Key` header. A sliding-window rate limit (default 120
+requests/minute) applies per API key or client IP.
 
-### 3.1 Threat Model
+## 3. Security posture
 
-| Threat | Mitigation | Status |
-|--------|------------|--------|
-| Code injection | No eval/exec, input validation | ✅ Mitigated |
-| Dependency attacks | Pin versions, audit scans | ✅ Mitigated |
-| Data exfiltration | Local-first, no cloud required | ✅ Mitigated |
-| Privilege escalation | Non-root Docker, sandboxing | ✅ Mitigated |
-| Supply chain | Clean-room, auditable | ✅ Mitigated |
+SandFish is meant for local or trusted-network use. The shipped defaults
+and guardrails:
 
-### 3.2 Audit Results
+- Non-root user in the Docker runtime image.
+- Optional API-key auth and rate limiting on the HTTP layer.
+- A static auditor (`sandfish security-audit`) that scans for common unsafe
+  patterns (`eval`, `exec`, bare `subprocess shell=True`, hardcoded
+  secrets), invokes `bandit` when available, and reports findings by
+  severity. The audit exits non-zero on `CRITICAL` or `HIGH`.
+- No eval or exec on untrusted content in the core.
 
-Automated security scanning reveals:
-- **0 critical vulnerabilities**
-- **0 high-severity issues**
-- **0 hardcoded secrets**
-- **0 dangerous code patterns**
+Known limits:
 
-### 3.3 Comparison with Foreign Alternatives
+- No multi-tenant isolation. All simulations run in the same process.
+- No TLS termination; put SandFish behind a reverse proxy if exposed.
+- The bundled agents do not call any LLM. If you plug one in, you own the
+  egress policy.
 
-MiroFish security audit revealed:
-- 15 files with Zep Cloud dependencies
-- Chinese code comments (provenance unknown)
-- Hardcoded default secrets
-- Development server in production paths
+## 4. Testing
 
-SandFish addresses all identified issues.
+The `tests/` directory covers agent behaviour (energy budget, action
+selection, history bounds), orchestrator control flow (pause, resume, stop,
+natural completion), edge cases (zero-agent / zero-round simulations,
+Unicode names, nonexistent IDs), and a handful of integration tests that
+run real small simulations against a temporary vault.
 
----
-
-## 4. Performance Evaluation
-
-### 4.1 Benchmark Environment
-
-- **Hardware**: 4 vCPU, 8GB RAM
-- **OS**: Ubuntu 22.04 LTS
-- **Python**: 3.11.6
-- **SandFish**: 0.1.0
-
-### 4.2 Results
-
-| Metric | SandFish | MiroFish | Improvement |
-|--------|----------|----------|-------------|
-| Startup time | 500ms | 2000ms | 4x faster |
-| Memory/agent | 0.76MB | 1.2MB | 37% less |
-| API latency (p50) | 10ms | 50ms | 5x faster |
-| API latency (p95) | 20ms | 150ms | 7.5x faster |
-| Agent throughput | 1000/sec | 200/sec | 5x faster |
-| Simulation speed | 100 rounds/sec | 20 rounds/sec | 5x faster |
-| Monthly cost | $0 | $150+ | Free |
-
-### 4.3 Scalability
-
-| Agents | Memory | CPU | Rounds/sec |
-|--------|--------|-----|------------|
-| 100 | 120MB | 15% | 95 |
-| 500 | 420MB | 45% | 85 |
-| 1000 | 800MB | 85% | 45 |
-| 2000 | 1.5GB | 100% | 20 |
-
-Linear scaling to ~1000 agents on standard hardware.
-
----
-
-## 5. Use Cases
-
-### 5.1 Prediction Market Simulation
-
-Model trader behavior in prediction markets (Kalshi, Polymarket):
-- Agent personalities based on real trader profiles
-- Market impact modeling
-- Strategy validation before capital deployment
-
-### 5.2 Social Network Dynamics
-
-Simulate information spread:
-- Viral content modeling
-- Influence network analysis
-- Disinformation campaign detection
-
-### 5.3 Policy Impact Assessment
-
-Model population response to policy changes:
-- Multi-stakeholder simulation
-- Unintended consequence discovery
-- Optimal policy parameter search
-
-### 5.4 Automated Trading Strategy Testing
-
-Validate algorithmic trading strategies:
-- Agent-based market simulation
-- Strategy robustness testing
-- Risk scenario modeling
-
----
-
-## 6. Deployment Options
-
-### 6.1 Local Development
+Run the suite with:
 
 ```bash
-pip install sandfish
-sandfish orchestrator --rounds 100
+pip install -e '.[dev]'
+pytest
 ```
 
-### 6.2 Docker
+## 5. Benchmarks
+
+`benchmarks/run_all.py` measures orchestrator startup, agent-creation
+throughput, full-simulation throughput, and (optional) process memory per
+agent. Results depend on hardware, vault size, and Python version, so the
+repo deliberately does not publish canonical numbers.
+
+To run them:
 
 ```bash
-docker run -p 8000:8000 jmiaie/sandfish
+pip install -e '.[dev]' psutil
+python benchmarks/run_all.py
 ```
 
-### 6.3 Kubernetes
+Each invocation writes `benchmark_report.json` in the working directory and
+prints a summary.
 
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: sandfish
-spec:
-  replicas: 3
-  selector:
-    matchLabels:
-      app: sandfish
-  template:
-    spec:
-      containers:
-      - name: sandfish
-        image: jmiaie/sandfish:latest
-        ports:
-        - containerPort: 8000
-```
+## 6. Roadmap
 
-### 6.4 Cloud Platforms
+Near-term candidates:
 
-- **AWS**: ECS, EKS, or EC2 with Docker
-- **GCP**: Cloud Run or GKE
-- **Azure**: Container Instances or AKS
+- Structured configuration for agent cohorts beyond the default/influencer/
+  lurker mix.
+- Optional persistence of agent state across runs.
+- A minimal read-only dashboard backed by the event stream.
+- Pluggable LLM-backed agents (with the policy work that implies).
 
----
+Longer-term, out of current scope: distributed execution, custom OMPA
+backends, or horizontal scale.
 
-## 7. Future Directions
+## 7. License
 
-SandFish is under active development with focus on:
-
-- **Scalability**: Distributed simulation across multiple nodes
-- **Integration**: Real-time market data feeds and trading APIs
-- **Intelligence**: Enhanced agent reasoning capabilities
-- **Enterprise**: Security, compliance, and management features
-
-The project welcomes community contributions and follows semantic versioning for releases.
-
----
-
-## 8. Conclusion
-
-SandFish represents a significant advancement in open-source multi-agent simulation platforms. By prioritizing security, cost-effectiveness, and platform independence, we have created a tool that addresses the limitations of existing solutions while maintaining enterprise-grade performance.
-
-Key achievements:
-- **100% auditable codebase** with zero foreign dependencies
-- **Zero mandatory cloud costs** saving $150+/month
-- **5x performance improvement** over alternatives
-- **Production-ready** from day one
-
-We invite the community to contribute, audit, and extend SandFish for their specific use cases.
-
----
-
-## References
-
-1. SandFish Repository: https://github.com/jmiaie/sandfish
-2. PyPI Package: https://pypi.org/project/sandfish/
-3. OMPA Framework: https://github.com/jmiaie/ompa
-4. MiroFish Security Audit: `/docs/MiroFish_SECURITY_AUDIT.md`
-5. Performance Benchmarks: `/docs/PERFORMANCE_AUDIT.md`
-
----
-
-## Appendix A: API Reference
-
-See full API documentation at: https://docs.sandfish.ai/api
-
-## Appendix B: Configuration Reference
-
-See configuration guide at: `/docs/CONFIG.md`
-
-## Appendix C: Security Checklist
-
-See security hardening guide at: `/docs/SECURITY.md`
-
----
-
-**License**: MIT  
-**Copyright**: 2026 Micap AI  
-**Contact**: jarv@micap.ai
-
----
-
-*Built with 🤖 in the desert.*
+MIT. See `LICENSE`.
