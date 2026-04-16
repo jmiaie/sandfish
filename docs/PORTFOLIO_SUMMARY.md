@@ -1,8 +1,8 @@
-# SandFish - Portfolio Summary
+# AegisFlow - Portfolio Summary
 
 ## Professional Overview
 
-**SandFish** is a production-grade, open-source multi-agent swarm intelligence platform that I architected and developed from scratch. Built as a clean-room implementation with zero foreign dependencies, it addresses critical security and cost gaps in existing solutions.
+**AegisFlow** is a production-grade, open-source multi-agent swarm intelligence platform that I architected and developed from scratch. Built as a clean-room implementation with zero foreign dependencies, it addresses critical security and cost gaps in existing solutions.
 
 ---
 
@@ -86,18 +86,18 @@ Built a clean-room alternative from scratch with:
 
 | Resource | URL |
 |----------|-----|
-| **GitHub Repository** | https://github.com/jmiaie/sandfish |
-| **PyPI Package** | https://pypi.org/project/sandfish/ |
-| **Documentation** | https://github.com/jmiaie/sandfish/tree/main/docs |
-| **White Paper** | https://github.com/jmiaie/sandfish/blob/main/docs/WHITEPAPER.md |
-| **Docker Hub** | `docker pull jmiaie/sandfish` |
+| **GitHub Repository** | https://github.com/jmiaie/aegisflow |
+| **PyPI Package** | https://pypi.org/project/aegisflow/ |
+| **Documentation** | https://github.com/jmiaie/aegisflow/tree/main/docs |
+| **White Paper** | https://github.com/jmiaie/aegisflow/blob/main/docs/WHITEPAPER.md |
+| **Docker Hub** | `docker pull jmiaie/aegisflow` |
 
 ---
 
 ## Installation
 
 ```bash
-pip install sandfish
+pip install aegisflow
 ```
 
 ---

@@ -1,4 +1,4 @@
-# SandFish Performance & Benchmark Audit
+# AegisFlow Performance & Benchmark Audit
 
 **Date**: 2026-04-12  
 **Auditor**: 🤖 Jarv  
@@ -25,15 +25,15 @@
 - **Hardware**: 4 vCPU, 8GB RAM (Jarv tier)
 - **OS**: Ubuntu 22.04 LTS
 - **Python**: 3.11.6
-- **SandFish**: 0.1.0
+- **AegisFlow**: 0.1.0
 
 ### Benchmark Tools
 ```python
 # Built-in profiler
-python -m cProfile -o profile.stats -m sandfish.cli orchestrator
+python -m cProfile -o profile.stats -m aegisflow.cli orchestrator
 
 # Memory profiler
-mprof run sandfish orchestrator --rounds 100
+mprof run aegisflow orchestrator --rounds 100
 
 # Load testing
 locust -f benchmarks/locustfile.py
@@ -217,9 +217,9 @@ async def benchmark_agent_creation(n_agents):
 ### Horizontal Scaling (Distributed)
 
 ```
-[Load Balancer] → [SandFish Node 1] → [Shared OMPA Vault]
-                → [SandFish Node 2] →
-                → [SandFish Node N] →
+[Load Balancer] → [AegisFlow Node 1] → [Shared OMPA Vault]
+                → [AegisFlow Node 2] →
+                → [AegisFlow Node N] →
 ```
 
 **Requirements**:
@@ -231,7 +231,7 @@ async def benchmark_agent_creation(n_agents):
 
 ## Comparison with MiroFish
 
-| Metric | MiroFish | SandFish | Improvement |
+| Metric | MiroFish | AegisFlow | Improvement |
 |--------|----------|----------|-------------|
 | Startup | 2s | 0.5s | 4x faster |
 | Memory/agent | 1.2MB | 0.76MB | 37% less |
@@ -249,11 +249,11 @@ cd benchmarks
 python run_all.py --output report.json
 
 # Profile specific component
-python -m cProfile -o profile.stats sandfish orchestrator --rounds 100
+python -m cProfile -o profile.stats aegisflow orchestrator --rounds 100
 python -m pstats profile.stats
 
 # Memory profiling
-mprof run sandfish orchestrator --agents 1000 --rounds 100
+mprof run aegisflow orchestrator --agents 1000 --rounds 100
 mprof plot
 
 # Load testing
@@ -264,7 +264,7 @@ locust -f locustfile.py --host http://localhost:8000
 
 ## Conclusion
 
-SandFish 0.1.0 demonstrates **excellent performance** for a v0.1.0 release:
+AegisFlow 0.1.0 demonstrates **excellent performance** for a v0.1.0 release:
 
 ✅ **Fast startup** — Suitable for serverless  
 ✅ **Low memory** — Efficient agent storage  

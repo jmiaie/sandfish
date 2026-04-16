@@ -1,4 +1,4 @@
-# SandFish - Multi-agent Swarm Intelligence System
+# AegisFlow - Multi-agent Swarm Intelligence System
 # Production-grade container with security hardening
 
 FROM python:3.11-slim-bookworm AS builder
@@ -23,7 +23,7 @@ RUN pip install --upgrade pip && \
 FROM python:3.11-slim-bookworm
 
 # Security: Run as non-root user
-RUN groupadd -r sandfish && useradd -r -g sandfish sandfish
+RUN groupadd -r aegisflow && useradd -r -g aegisflow aegisflow
 
 # Install runtime dependencies only
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -39,25 +39,25 @@ ENV PATH="/opt/venv/bin:$PATH"
 WORKDIR /app
 
 # Copy application code
-COPY --chown=sandfish:sandfish sandfish/ ./sandfish/
-COPY --chown=sandfish:sandfish tests/ ./tests/
-COPY --chown=sandfish:sandfish pyproject.toml README.md ./
+COPY --chown=aegisflow:aegisflow aegisflow/ ./aegisflow/
+COPY --chown=aegisflow:aegisflow tests/ ./tests/
+COPY --chown=aegisflow:aegisflow pyproject.toml README.md ./
 
 # Install package
 RUN pip install -e .
 
 # Create vault directory
-RUN mkdir -p /app/vault && chown -R sandfish:sandfish /app
+RUN mkdir -p /app/vault && chown -R aegisflow:aegisflow /app
 
 # Security: Drop to non-root user
-USER sandfish
+USER aegisflow
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import sandfish; print('OK')" || exit 1
+    CMD python -c "import aegisflow; print('OK')" || exit 1
 
 # Expose API port
 EXPOSE 8000
 
 # Default command
-CMD ["sandfish", "api", "--host", "0.0.0.0", "--port", "8000", "--vault", "/app/vault"]
+CMD ["aegisflow", "api", "--host", "0.0.0.0", "--port", "8000", "--vault", "/app/vault"]

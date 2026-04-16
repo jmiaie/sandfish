@@ -1,52 +1,54 @@
-# SandFish
+# AegisFlow
 
-**A Clean-Room Multi-Agent Swarm Intelligence System**
+**The Universal, Security-First Multi-Agent Hybrid System**
 
-Built from scratch with security-first principles, zero foreign dependencies, and native OMPA integration.
+AegisFlow is a clean-room implementation of a distributed, multi-agent swarm intelligence system. It brings together the persistent memory structures of **OMPA**, the secure swarm capabilities of **AegisFlow**, and the powerful sub-agent sandbox environment of **DeerFlow** into a single, cohesive framework.
 
-## Overview
+## Core Principles
 
-SandFish is a distributed multi-agent simulation engine for prediction, scenario planning, and collective intelligence. Unlike foreign alternatives, SandFish is:
+- **Universal & Agnostic:** Pluggable at every layer. Works with any LLM, any runtime, any toolset.
+- **Security-First:** Built-in sandbox execution, granular permissions, and total auditability.
+- **Persistent Memory:** Temporal knowledge graphs and human-readable vaults ensure your agents never forget.
+- **Swarm Delegation:** Complex tasks are automatically decomposed and delegated to isolated sub-agents.
 
-- **100% auditable** — All code in English, fully documented
-- **Zero cloud lock-in** — OMPA-native memory (no Zep, no external APIs required)
-- **Security-first** — Production-grade from day one
-- **ZTB compliant** — Zero token burn, minimal operational cost
+## Architecture Highlights
 
-## Architecture
+AegisFlow operates on three primary axes:
+1. **Memory (OMPA):** Vaults, Palaces, and Temporal Knowledge Graphs.
+2. **Execution (DeerFlow):** Strict, containerized sandbox environments for tool use.
+3. **Orchestration (AegisFlow):** Multi-agent coordination with strict context boundaries.
 
-```
-SandFish/
-├── core/           # Simulation engine
-├── memory/         # OMPA integration
-├── agents/         # Swarm agent definitions
-├── api/            # FastAPI REST/WebSocket
-├── security/       # Audit, sandbox, crypto
-└── tests/          # Comprehensive coverage
-```
+See [ARCHITECTURE.md](ARCHITECTURE.md) for a deep dive into the system design.
 
-## Quick Start
+## Installation
 
 ```bash
-# Install
-pip install sandfish
+# Clone the repository
+git clone https://github.com/your-org/aegisflow.git
+cd aegisflow
 
-# Configure
-export OMPA_VAULT_PATH="/path/to/vault"
-export LLM_API_KEY="your-key"
-
-# Run
-sandfish orchestrator --config config.yaml
+# Install dependencies (requires Python 3.10+)
+pip install -e .
 ```
 
-## Security
+## Quick Start (Coming Soon)
 
-See [SECURITY.md](docs/SECURITY.md) for audit reports and hardening guide.
+```python
+from aegisflow import Orchestrator, MemoryVault, Sandbox
+
+# Initialize the universal memory layer
+memory = MemoryVault(path="./my_vault")
+
+# Initialize the secure execution sandbox
+sandbox = Sandbox(isolation="container", workspace="./workspace")
+
+# Create the swarm orchestrator
+swarm = Orchestrator(memory=memory, sandbox=sandbox)
+
+# Execute a complex task
+result = swarm.execute("Analyze the logs in ./workspace and summarize the security incidents.")
+```
 
 ## License
 
-MIT — See [LICENSE](LICENSE)
-
----
-
-Built with 🤖 in the desert.
+MIT

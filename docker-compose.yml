@@ -1,12 +1,12 @@
 version: '3.8'
 
 services:
-  sandfish:
+  aegisflow:
     build:
       context: .
       dockerfile: Dockerfile
-    image: sandfish:latest
-    container_name: sandfish
+    image: aegisflow:latest
+    container_name: aegisflow
     ports:
       - "8000:8000"
     volumes:
@@ -28,9 +28,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: sandfish:latest
-    container_name: sandfish-orchestrator
-    command: ["sandfish", "orchestrator", "--vault", "/app/vault", "--rounds", "1000"]
+    image: aegisflow:latest
+    container_name: aegisflow-orchestrator
+    command: ["aegisflow", "orchestrator", "--vault", "/app/vault", "--rounds", "1000"]
     volumes:
       - ./vault:/app/vault
       - ./logs:/app/logs

@@ -1,11 +1,11 @@
 # Installation Guide
 
-SandFish is platform-agnostic and runs on any system with Python 3.10+.
+AegisFlow is platform-agnostic and runs on any system with Python 3.10+.
 
 ## Quick Install
 
 ```bash
-pip install sandfish
+pip install aegisflow
 ```
 
 ## Platform-Specific Instructions
@@ -18,14 +18,14 @@ sudo apt update
 sudo apt install python3.11 python3.11-pip python3.11-venv
 
 # Create virtual environment
-python3.11 -m venv sandfish-env
-source sandfish-env/bin/activate
+python3.11 -m venv aegisflow-env
+source aegisflow-env/bin/activate
 
-# Install SandFish
-pip install sandfish
+# Install AegisFlow
+pip install aegisflow
 
 # Run
-sandfish --version
+aegisflow --version
 ```
 
 ### macOS
@@ -35,14 +35,14 @@ sandfish --version
 brew install python@3.11
 
 # Create virtual environment
-python3.11 -m venv sandfish-env
-source sandfish-env/bin/activate
+python3.11 -m venv aegisflow-env
+source aegisflow-env/bin/activate
 
-# Install SandFish
-pip install sandfish
+# Install AegisFlow
+pip install aegisflow
 
 # Run
-sandfish --version
+aegisflow --version
 ```
 
 ### Windows (Native)
@@ -50,14 +50,14 @@ sandfish --version
 ```powershell
 # Install Python 3.10+ from python.org
 # Create virtual environment
-python -m venv sandfish-env
-sandfish-env\Scripts\activate
+python -m venv aegisflow-env
+aegisflow-env\Scripts\activate
 
-# Install SandFish
-pip install sandfish
+# Install AegisFlow
+pip install aegisflow
 
 # Run
-sandfish --version
+aegisflow --version
 ```
 
 ### Windows (WSL2) - Recommended
@@ -67,24 +67,24 @@ sandfish --version
 sudo apt update
 sudo apt install python3.11 python3.11-pip python3.11-venv
 
-python3.11 -m venv sandfish-env
-source sandfish-env/bin/activate
-pip install sandfish
+python3.11 -m venv aegisflow-env
+source aegisflow-env/bin/activate
+pip install aegisflow
 ```
 
 ### Docker (All Platforms)
 
 ```bash
 # Pull from Docker Hub (when published)
-docker pull jmiaie/sandfish:latest
+docker pull jmiaie/aegisflow:latest
 
 # Or build locally
-git clone https://github.com/jmiaie/sandfish.git
-cd sandfish
-docker build -t sandfish .
+git clone https://github.com/jmiaie/aegisflow.git
+cd aegisflow
+docker build -t aegisflow .
 
 # Run
-docker run -p 8000:8000 sandfish
+docker run -p 8000:8000 aegisflow
 
 # Or use docker-compose
 docker-compose up
@@ -98,11 +98,11 @@ sudo apt update
 sudo apt install python3-pip python3-venv libsqlite3-dev
 
 # Create virtual environment
-python3 -m venv sandfish-env
-source sandfish-env/bin/activate
+python3 -m venv aegisflow-env
+source aegisflow-env/bin/activate
 
-# Install SandFish
-pip install sandfish
+# Install AegisFlow
+pip install aegisflow
 
 # Note: First install may take longer on ARM due to compilation
 ```
@@ -116,7 +116,7 @@ pip install sandfish
 #!/bin/bash
 apt update
 apt install -y docker.io
-docker run -d -p 80:8000 jmiaie/sandfish:latest
+docker run -d -p 80:8000 jmiaie/aegisflow:latest
 ```
 
 ### Google Cloud Run
@@ -126,12 +126,12 @@ docker run -d -p 80:8000 jmiaie/sandfish:latest
 apiVersion: serving.knative.dev/v1
 kind: Service
 metadata:
-  name: sandfish
+  name: aegisflow
 spec:
   template:
     spec:
       containers:
-      - image: jmiaie/sandfish:latest
+      - image: jmiaie/aegisflow:latest
         ports:
         - containerPort: 8000
 ```
@@ -147,8 +147,8 @@ kubectl apply -f k8s/service.yaml
 ## Development Install
 
 ```bash
-git clone https://github.com/jmiaie/sandfish.git
-cd sandfish
+git clone https://github.com/jmiaie/aegisflow.git
+cd aegisflow
 pip install -e ".[dev]"
 ```
 
@@ -156,16 +156,16 @@ pip install -e ".[dev]"
 
 ```bash
 # Check installation
-sandfish --version
+aegisflow --version
 
 # Run tests
 pytest tests/
 
 # Run security audit
-sandfish security-audit
+aegisflow security-audit
 
 # Start API
-sandfish api --port 8000
+aegisflow api --port 8000
 ```
 
 ## Troubleshooting
@@ -182,16 +182,16 @@ pip install 'ompa[semantic]'
 # Use virtual environment instead of system Python
 python3 -m venv myenv
 source myenv/bin/activate
-pip install sandfish
+pip install aegisflow
 ```
 
 ### Windows Path Issues
 
 ```powershell
 # Use forward slashes or double backslashes
-sandfish orchestrator --vault "C:/Users/Name/vault"
+aegisflow orchestrator --vault "C:/Users/Name/vault"
 # or
-sandfish orchestrator --vault "C:\\Users\\Name\\vault"
+aegisflow orchestrator --vault "C:\\Users\\Name\\vault"
 ```
 
 ## System Requirements

@@ -1,4 +1,4 @@
-# SandFish: A Clean-Room Multi-Agent Swarm Intelligence System
+# AegisFlow: A Clean-Room Multi-Agent Swarm Intelligence System
 
 ## White Paper
 
@@ -11,7 +11,7 @@
 
 ## Abstract
 
-SandFish is a production-grade, open-source multi-agent swarm intelligence platform designed for prediction markets, scenario planning, and collective intelligence applications. Built as a clean-room implementation with zero foreign dependencies, SandFish addresses critical security and cost concerns present in existing solutions. By leveraging the OMPA (Obsidian-Memory-Palace-Agnostic) framework for local-first memory management, SandFish eliminates mandatory cloud service dependencies while maintaining enterprise-grade performance.
+AegisFlow is a production-grade, open-source multi-agent swarm intelligence platform designed for prediction markets, scenario planning, and collective intelligence applications. Built as a clean-room implementation with zero foreign dependencies, AegisFlow addresses critical security and cost concerns present in existing solutions. By leveraging the OMPA (Obsidian-Memory-Palace-Agnostic) framework for local-first memory management, AegisFlow eliminates mandatory cloud service dependencies while maintaining enterprise-grade performance.
 
 **Key Contributions**:
 - Zero cloud lock-in architecture (saves $150+/month vs. alternatives)
@@ -35,7 +35,7 @@ Multi-agent systems have emerged as a powerful paradigm for modeling complex soc
 
 ### 1.2 Motivation
 
-The need for a clean, auditable, cost-effective multi-agent platform motivated the creation of SandFish. Our design goals were:
+The need for a clean, auditable, cost-effective multi-agent platform motivated the creation of AegisFlow. Our design goals were:
 
 1. **Security-first**: Every component auditable, no black-box dependencies
 2. **Zero token burn**: No mandatory external API costs
@@ -50,7 +50,7 @@ The need for a clean, auditable, cost-effective multi-agent platform motivated t
 | MiroFish | $150+/mo | ❌ | Foreign (Chinese) | Moderate |
 | AutoGen | Variable | Partial | Microsoft | Good |
 | CrewAI | Variable | Partial | Open | Good |
-| **SandFish** | **$0** | **✅ Full** | **Clean-room** | **Excellent** |
+| **AegisFlow** | **$0** | **✅ Full** | **Clean-room** | **Excellent** |
 
 ---
 
@@ -58,7 +58,7 @@ The need for a clean, auditable, cost-effective multi-agent platform motivated t
 
 ### 2.1 System Overview
 
-SandFish follows a modular, layered architecture:
+AegisFlow follows a modular, layered architecture:
 
 ```
 ┌─────────────────────────────────────────┐
@@ -161,7 +161,7 @@ MiroFish security audit revealed:
 - Hardcoded default secrets
 - Development server in production paths
 
-SandFish addresses all identified issues.
+AegisFlow addresses all identified issues.
 
 ---
 
@@ -172,11 +172,11 @@ SandFish addresses all identified issues.
 - **Hardware**: 4 vCPU, 8GB RAM
 - **OS**: Ubuntu 22.04 LTS
 - **Python**: 3.11.6
-- **SandFish**: 0.1.0
+- **AegisFlow**: 0.1.0
 
 ### 4.2 Results
 
-| Metric | SandFish | MiroFish | Improvement |
+| Metric | AegisFlow | MiroFish | Improvement |
 |--------|----------|----------|-------------|
 | Startup time | 500ms | 2000ms | 4x faster |
 | Memory/agent | 0.76MB | 1.2MB | 37% less |
@@ -236,14 +236,14 @@ Validate algorithmic trading strategies:
 ### 6.1 Local Development
 
 ```bash
-pip install sandfish
-sandfish orchestrator --rounds 100
+pip install aegisflow
+aegisflow orchestrator --rounds 100
 ```
 
 ### 6.2 Docker
 
 ```bash
-docker run -p 8000:8000 jmiaie/sandfish
+docker run -p 8000:8000 jmiaie/aegisflow
 ```
 
 ### 6.3 Kubernetes
@@ -252,17 +252,17 @@ docker run -p 8000:8000 jmiaie/sandfish
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: sandfish
+  name: aegisflow
 spec:
   replicas: 3
   selector:
     matchLabels:
-      app: sandfish
+      app: aegisflow
   template:
     spec:
       containers:
-      - name: sandfish
-        image: jmiaie/sandfish:latest
+      - name: aegisflow
+        image: jmiaie/aegisflow:latest
         ports:
         - containerPort: 8000
 ```
@@ -277,7 +277,7 @@ spec:
 
 ## 7. Future Directions
 
-SandFish is under active development with focus on:
+AegisFlow is under active development with focus on:
 
 - **Scalability**: Distributed simulation across multiple nodes
 - **Integration**: Real-time market data feeds and trading APIs
@@ -290,7 +290,7 @@ The project welcomes community contributions and follows semantic versioning for
 
 ## 8. Conclusion
 
-SandFish represents a significant advancement in open-source multi-agent simulation platforms. By prioritizing security, cost-effectiveness, and platform independence, we have created a tool that addresses the limitations of existing solutions while maintaining enterprise-grade performance.
+AegisFlow represents a significant advancement in open-source multi-agent simulation platforms. By prioritizing security, cost-effectiveness, and platform independence, we have created a tool that addresses the limitations of existing solutions while maintaining enterprise-grade performance.
 
 Key achievements:
 - **100% auditable codebase** with zero foreign dependencies
@@ -298,14 +298,14 @@ Key achievements:
 - **5x performance improvement** over alternatives
 - **Production-ready** from day one
 
-We invite the community to contribute, audit, and extend SandFish for their specific use cases.
+We invite the community to contribute, audit, and extend AegisFlow for their specific use cases.
 
 ---
 
 ## References
 
-1. SandFish Repository: https://github.com/jmiaie/sandfish
-2. PyPI Package: https://pypi.org/project/sandfish/
+1. AegisFlow Repository: https://github.com/jmiaie/aegisflow
+2. PyPI Package: https://pypi.org/project/aegisflow/
 3. OMPA Framework: https://github.com/jmiaie/ompa
 4. MiroFish Security Audit: `/docs/MiroFish_SECURITY_AUDIT.md`
 5. Performance Benchmarks: `/docs/PERFORMANCE_AUDIT.md`
@@ -314,7 +314,7 @@ We invite the community to contribute, audit, and extend SandFish for their spec
 
 ## Appendix A: API Reference
 
-See full API documentation at: https://docs.sandfish.ai/api
+See full API documentation at: https://docs.aegisflow.ai/api
 
 ## Appendix B: Configuration Reference
 

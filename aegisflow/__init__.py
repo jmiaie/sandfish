@@ -1,5 +1,5 @@
 """
-SandFish - Clean-room multi-agent swarm intelligence system.
+AegisFlow - Clean-room multi-agent swarm intelligence system.
 """
 
 __version__ = "0.1.0"

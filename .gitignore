@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 *.pyo
+benchmarks/temp_aegisflow_sandbox/
+benchmarks/temp_aegisflow_vault/
+benchmarks/results/
