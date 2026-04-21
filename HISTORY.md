@@ -9,7 +9,7 @@
 - **AegisFlow (v2)** — Architecture iteration exploring stricter sandbox boundaries,
   a universal memory bridge (GBrain + OMPA integration), and an explicit
   lead-agent / sub-agent delegation model.
-  Separate repository: [`jmiaie/af`](https://github.com/jmiaie/af).
+  Separate repository: `jmiaie/aegisflow` *(archived; see AegisFlow skill in workspace)*.
 
 ## Audit Note
 
@@ -21,6 +21,6 @@ merged into this repository before being moved to their intended home:
 | `fb168e6` | Merge PR #1: scaffold AegisFlow core architecture   |
 | `a70f771` | Purge SandFish references from AegisFlow main       |
 
-Those commits are superseded by the ongoing work in [`jmiaie/af`](https://github.com/jmiaie/af)
+Those commits are superseded by the ongoing work in `jmiaie/aegisflow` *(archived)*
 and are recorded here for transparency. This repository was reset to preserve
 SandFish in its original, standalone form as a portfolio reference.
