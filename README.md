@@ -14,6 +14,7 @@ internet without the auth and rate-limit settings below.
 ## Features
 
 - Round-based orchestrator with pause, resume, and stop semantics.
+- Reproducible runs: set a `seed` and the same config replays identically.
 - Pluggable agent types (`default`, `influencer`, `lurker`) with a factory
   hook for custom agents.
 - OMPA vault as the single source of truth for events, entities, and
@@ -59,6 +60,34 @@ Pass `--config path/to/config.json` (or `.yaml`) to load defaults from a file;
 explicit `--rounds` / `--agents` flags still win. Use `--dry-run` to create
 the simulation without executing it, and `--checkpoint-dir DIR` to persist
 per-round checkpoints.
+
+### Reproducible runs
+
+Pass `--seed` (or set `seed` in the config file, or `seed` in the
+`POST /api/simulations` body) to make a run repeatable:
+
+```bash
+sandfish orchestrator --rounds 50 --agents 20 --seed 1234
+```
+
+Two runs with the same seed and config produce identical action sequences,
+agent states, and post IDs. Each agent draws from its own stream derived from
+the run seed, so results do not depend on how the agents' async decisions
+interleave. Without a seed, every run is independently seeded from the OS.
+
+Simulation and agent *identifiers* stay unique per run by design; only the
+simulation dynamics reproduce.
+
+Custom agents must draw randomness from `self.rng` (a `random.Random`) rather
+than the `random` module, or their decisions will not replay under a seed.
+
+### Checkpoints
+
+Checkpoints are labelled by rounds *completed*, so a checkpoint at round 10
+holds the state after 10 rounds. The last executed round is always
+checkpointed, even when the round count is not a multiple of
+`checkpoint_interval` or the run was stopped early. Set
+`checkpoint_interval: 0` to disable checkpointing.
 
 ### Run the HTTP API
 

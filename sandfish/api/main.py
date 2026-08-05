@@ -71,6 +71,10 @@ class CreateSimulationRequest(BaseModel):
     num_agents: int = Field(default=10, ge=1, le=10_000)
     agent_types: List[str] = Field(default_factory=lambda: ["default"])
     seed_data: Dict[str, Any] = Field(default_factory=dict)
+    seed: Optional[int] = Field(
+        default=None,
+        description="RNG seed; runs with the same seed and config are reproducible",
+    )
 
 
 class SimulationResponse(BaseModel):
@@ -330,6 +334,7 @@ async def create_simulation(request: CreateSimulationRequest) -> SimulationRespo
         num_agents=request.num_agents,
         agent_types=request.agent_types,
         seed_data=request.seed_data,
+        seed=request.seed,
     )
     sim_id = orch.create_simulation(config)
     return _status_to_response(orch, sim_id)
