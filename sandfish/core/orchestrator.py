@@ -8,6 +8,7 @@ import asyncio
 import inspect
 import json
 import logging
+import random
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -31,6 +32,15 @@ class SimulationStatus(Enum):
 # Statuses that the run loop should treat as "exit immediately".
 _TERMINAL_RUN_STATUSES = {SimulationStatus.STOPPED, SimulationStatus.FAILED}
 
+# Statuses after which a simulation will never run again, so its agents can be
+# released. PAUSED is deliberately absent: a paused run resumes with the same
+# agent objects.
+_FINISHED_STATUSES = {
+    SimulationStatus.COMPLETED,
+    SimulationStatus.STOPPED,
+    SimulationStatus.FAILED,
+}
+
 
 @dataclass
 class SimulationConfig:
@@ -43,6 +53,11 @@ class SimulationConfig:
     seed_data: Dict[str, Any] = field(default_factory=dict)
     enable_logging: bool = True
     checkpoint_interval: int = 10
+    # RNG seed for reproducible runs. With a seed set, two runs of the same
+    # config produce identical action sequences. Left as None, each run is
+    # independently seeded from the OS. Distinct from `seed_data`, which
+    # carries starting agent attributes rather than randomness.
+    seed: Optional[int] = None
 
 
 @dataclass
@@ -120,6 +135,9 @@ class SwarmOrchestrator:
             "end_time": None,
             "checkpoints": [],
             "error": None,
+            # Snapshot taken when agents are released; see _release_agents.
+            "final_state": None,
+            "last_checkpoint_round": None,
         }
         self._sim_locks[sim_id] = asyncio.Lock()
 
@@ -169,8 +187,14 @@ class SwarmOrchestrator:
                     sim["current_round"] = round_num
                     await self._execute_round(sim_id, round_num)
 
-                    if config.checkpoint_interval and round_num % config.checkpoint_interval == 0:
-                        await self._create_checkpoint(sim_id)
+                    # Count completed rounds, not the zero-based index: the old
+                    # `round_num % interval` snapshotted round 0 (after a single
+                    # round) and then drifted off the interval boundary.
+                    if (
+                        config.checkpoint_interval
+                        and (round_num + 1) % config.checkpoint_interval == 0
+                    ):
+                        await self._create_checkpoint(sim_id, round_num + 1)
 
                     await self._emit_event(
                         "round_complete",
@@ -194,12 +218,16 @@ class SwarmOrchestrator:
                             "Simulation %s stopped at round %d", sim_id, round_num
                         )
                         sim["end_time"] = _utcnow()
-                        return self._create_result(sim, partial=True)
+                        await self._create_final_checkpoint(sim_id, partial=True)
+                        result = self._create_result(sim, partial=True)
+                        self._release_agents(sim_id)
+                        return result
 
                 # Loop completed naturally.
                 sim["status"] = SimulationStatus.COMPLETED
                 sim["current_round"] = config.max_rounds
                 sim["end_time"] = _utcnow()
+                await self._create_final_checkpoint(sim_id)
 
             except Exception as exc:
                 sim["status"] = SimulationStatus.FAILED
@@ -208,6 +236,7 @@ class SwarmOrchestrator:
                 self.logger.exception("Simulation %s failed", sim_id)
 
             result = self._create_result(sim)
+            self._release_agents(sim_id)
 
             self.memory.record_event(
                 event_type="SIMULATION_COMPLETED",
@@ -234,10 +263,19 @@ class SwarmOrchestrator:
 
         for i in range(config.num_agents):
             agent_type = config.agent_types[i % len(config.agent_types)]
+
+            # Give each agent its own stream derived from the run seed, so a
+            # seeded run is reproducible no matter how the agents' async
+            # decide_action calls interleave. The string form is hashed with
+            # SHA-512 by random.Random, so adjacent seeds do not yield
+            # overlapping streams and results do not depend on PYTHONHASHSEED.
+            rng = random.Random(f"{config.seed}:{i}") if config.seed is not None else None
+
             agent = create_agent(
                 agent_type=agent_type,
                 agent_id=f"{sim_id}_agent_{i}",
                 memory_adapter=self.memory,
+                rng=rng,
             )
             sim["agents"].append(agent.id)
             self.agents[agent.id] = agent
@@ -271,18 +309,69 @@ class SwarmOrchestrator:
         # Default implementation is a no-op; useful tests live in subclasses.
         return None
 
-    async def _create_checkpoint(self, sim_id: str) -> None:
-        """Snapshot agent state and persist to disk if configured."""
+    async def _create_final_checkpoint(self, sim_id: str, partial: bool = False) -> None:
+        """Checkpoint the last executed round, unless it already was.
+
+        Without this, a run whose round count is not a multiple of
+        `checkpoint_interval` — or one stopped mid-interval — left its final
+        rounds unsnapshotted, so the last checkpoint could trail the actual
+        end state by up to `checkpoint_interval` rounds.
+        """
+        sim = self.simulations[sim_id]
+        if not sim["config"].checkpoint_interval:
+            return
+
+        rounds_completed = self._rounds_completed(sim, partial)
+        if rounds_completed <= 0:
+            return
+        if sim["last_checkpoint_round"] == rounds_completed:
+            return
+
+        await self._create_checkpoint(sim_id, rounds_completed)
+
+    def _release_agents(self, sim_id: str) -> None:
+        """Drop agent objects for a simulation that will not run again.
+
+        `self.agents` is process-wide and the API server is long-lived, so
+        every finished run used to leak its agents — each holding an action
+        history of up to DEFAULT_HISTORY_LIMIT entries — for the life of the
+        process. The final state is snapshotted first, so results and status
+        queries are unaffected.
+        """
+        sim = self.simulations.get(sim_id)
+        if sim is None or sim["status"] not in _FINISHED_STATUSES:
+            return
+
+        if sim["final_state"] is None:
+            sim["final_state"] = {
+                aid: self.agents[aid].get_state()
+                for aid in sim["agents"]
+                if aid in self.agents
+            }
+
+        for agent_id in sim["agents"]:
+            self.agents.pop(agent_id, None)
+
+    async def _create_checkpoint(self, sim_id: str, rounds_completed: int) -> None:
+        """Snapshot agent state and persist to disk if configured.
+
+        `rounds_completed` labels the checkpoint by how many rounds have
+        finished, so a checkpoint at label 10 always means "state after 10
+        rounds" regardless of where it was taken from.
+        """
         sim = self.simulations[sim_id]
 
         checkpoint = {
-            "round": sim["current_round"],
+            "round": rounds_completed,
             "timestamp": _utcnow().isoformat(),
             "agent_states": {
-                aid: self.agents[aid].get_state() for aid in sim["agents"]
+                aid: self.agents[aid].get_state()
+                for aid in sim["agents"]
+                if aid in self.agents
             },
         }
         sim["checkpoints"].append(checkpoint)
+        sim["last_checkpoint_round"] = rounds_completed
 
         if self.checkpoint_dir is not None:
             path = self.checkpoint_dir / f"{sim_id}_round_{checkpoint['round']:06d}.json"
@@ -325,7 +414,13 @@ class SwarmOrchestrator:
         if sim is None:
             return False
         if sim["status"] in (SimulationStatus.RUNNING, SimulationStatus.PAUSED):
+            was_paused = sim["status"] == SimulationStatus.PAUSED
             sim["status"] = SimulationStatus.STOPPED
+            if was_paused:
+                # A running sim is released by its own run loop; a paused one
+                # has no loop to observe the stop, so free its agents here.
+                sim["end_time"] = _utcnow()
+                self._release_agents(sim_id)
             self.logger.info("Stopped simulation %s", sim_id)
             return True
         return False
@@ -379,20 +474,24 @@ class SwarmOrchestrator:
 
     # ----- Result construction -----
 
-    def _create_result(self, sim: Dict[str, Any], partial: bool = False) -> SimulationResult:
-        """Build a SimulationResult for the current state of `sim`.
+    def _rounds_completed(self, sim: Dict[str, Any], partial: bool = False) -> int:
+        """Number of rounds fully executed.
 
         On natural completion the run loop already advances current_round to
         max_rounds, so rounds_completed == current_round. On a partial exit
         (pause/stop) the current_round is the index of the last fully executed
-        round, so rounds_completed == current_round + 1.
+        round, so rounds_completed == current_round + 1. On a failure the
+        current round threw before finishing, so it is not counted.
         """
         if not sim["agents_initialized"]:
-            rounds_completed = 0
-        elif partial:
-            rounds_completed = sim["current_round"] + 1
-        else:
-            rounds_completed = sim["current_round"]
+            return 0
+        if partial:
+            return sim["current_round"] + 1
+        return sim["current_round"]
+
+    def _create_result(self, sim: Dict[str, Any], partial: bool = False) -> SimulationResult:
+        """Build a SimulationResult for the current state of `sim`."""
+        rounds_completed = self._rounds_completed(sim, partial)
 
         return SimulationResult(
             simulation_id=sim["id"],
@@ -406,7 +505,15 @@ class SwarmOrchestrator:
         )
 
     def _aggregate_final_state(self, sim: Dict[str, Any]) -> Dict[str, Any]:
-        """Aggregate per-agent state for the result."""
+        """Aggregate per-agent state for the result.
+
+        Prefers the snapshot taken when the agents were released, so results
+        stay complete after a finished run's agents are freed.
+        """
+        cached = sim["final_state"]
+        if cached is not None:
+            return cached
+
         return {
             aid: self.agents[aid].get_state()
             for aid in sim["agents"]

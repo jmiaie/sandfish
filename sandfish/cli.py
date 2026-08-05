@@ -93,6 +93,8 @@ def _build_simulation_config(
         base["max_rounds"] = args.rounds
     if args.agents_set:
         base["num_agents"] = args.agents
+    if getattr(args, "seed", None) is not None:
+        base["seed"] = args.seed
 
     return SimulationConfig(**base)
 
@@ -208,6 +210,12 @@ def _build_parser() -> argparse.ArgumentParser:
     orch.add_argument("--config", help="Path to JSON or YAML config file")
     orch.add_argument("--rounds", type=int, default=100, help="Number of simulation rounds")
     orch.add_argument("--agents", type=int, default=10, help="Number of agents")
+    orch.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="RNG seed; runs with the same seed and config are reproducible",
+    )
     orch.add_argument(
         "--checkpoint-dir",
         default=None,
