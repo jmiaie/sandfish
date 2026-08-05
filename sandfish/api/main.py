@@ -77,6 +77,10 @@ class CreateSimulationRequest(BaseModel):
         description="Simulated date of round 0 (YYYY-MM-DD); dates memory writes.",
     )
     days_per_round: int = Field(default=1, ge=0, le=365)
+    seed: Optional[int] = Field(
+        default=None,
+        description="RNG seed; runs with the same seed and config are reproducible",
+    )
 
 
 class SimulationResponse(BaseModel):
@@ -338,6 +342,7 @@ async def create_simulation(request: CreateSimulationRequest) -> SimulationRespo
         seed_data=request.seed_data,
         start_date=request.start_date,
         days_per_round=request.days_per_round,
+        seed=request.seed,
     )
     try:
         sim_id = orch.create_simulation(config)
