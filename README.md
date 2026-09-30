@@ -1,5 +1,9 @@
 # SandFish
 
+> **Public swarm demo / portfolio reference (v1).**  
+> Deeper multi-agent product work lives in **AegisFlow**: private canonical [`jmiaie/af`](https://github.com/jmiaie/af), public mirror [`jmiaie/af_public`](https://github.com/jmiaie/af_public).  
+> Lineage (v1 → AegisFlow) and dual-maintenance guidance: **[HISTORY.md](HISTORY.md)** · **[docs/POSITIONING.md](docs/POSITIONING.md)**.
+
 Multi-agent swarm-simulation engine with local, OMPA-backed memory.
 
 SandFish runs round-based simulations of populations of lightweight agents
@@ -7,9 +11,11 @@ SandFish runs round-based simulations of populations of lightweight agents
 action per round, the orchestrator executes and records it, and callbacks or
 the HTTP API can observe the run in real time.
 
-It is a small, local-first research/simulation tool. It is **not** a
-production workload platform and should not be deployed in front of the public
-internet without the auth and rate-limit settings below.
+It is a small, local-first research/simulation tool kept as a **public demo**.
+It is **not** a production workload platform and should not be deployed in
+front of the public internet without the auth and rate-limit settings below.
+For AegisFlow (stricter sandbox, lead/sub-agent delegation), see
+[`jmiaie/af`](https://github.com/jmiaie/af) / [`jmiaie/af_public`](https://github.com/jmiaie/af_public).
 
 ## Features
 
@@ -135,6 +141,12 @@ pytest
 
 The suite covers agent behavior, orchestrator lifecycle, and a handful of
 integration and stress tests. Async tests run under `pytest-asyncio`.
+
+## Project history
+
+- [HISTORY.md](HISTORY.md) — SandFish (v1) → AegisFlow (v2) lineage
+- [docs/POSITIONING.md](docs/POSITIONING.md) — sandfish vs `af` vs `af_public`
+- [docs/PORTFOLIO_SUMMARY.md](docs/PORTFOLIO_SUMMARY.md) — engineering scope for portfolio viewers
 
 ## License
 
