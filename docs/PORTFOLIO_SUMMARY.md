@@ -77,7 +77,8 @@ A transparent, local-first sandbox for multi-agent simulations with:
 
 ## Links
 
-- Source: this repository.
+- Source: this repository ([jmiaie/sandfish](https://github.com/jmiaie/sandfish)).
+- Lineage / where active work lives: [HISTORY.md](../HISTORY.md), [POSITIONING.md](POSITIONING.md).
 - License: [MIT](../LICENSE)
 - Architecture write-up: [WHITEPAPER.md](WHITEPAPER.md)
 - Install notes: [INSTALL.md](INSTALL.md)

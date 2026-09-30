@@ -48,9 +48,9 @@ dev = [
 sandfish = "sandfish.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/micap/sandfish"
-Repository = "https://github.com/micap/sandfish"
-Documentation = "https://docs.sandfish.ai"
+Homepage = "https://github.com/jmiaie/sandfish"
+Repository = "https://github.com/jmiaie/sandfish"
+Documentation = "https://github.com/jmiaie/sandfish#readme"
 
 [tool.hatch.build.targets.wheel]
 packages = ["sandfish"]
