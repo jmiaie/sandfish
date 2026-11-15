@@ -10,7 +10,7 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
@@ -43,6 +43,18 @@ class SimulationConfig:
     seed_data: Dict[str, Any] = field(default_factory=dict)
     enable_logging: bool = True
     checkpoint_interval: int = 10
+    # Simulation calendar: round N happens on start_date + N * days_per_round.
+    # Memory writes (event notes, interaction facts) carry this date, so
+    # OMPA's temporal ranking ("yesterday", "last week") and as_of replay
+    # work in simulated time. None = every round is dated today.
+    start_date: Optional[str] = None
+    days_per_round: int = 1
+
+    def round_date(self, round_num: int) -> Optional[str]:
+        if not self.start_date:
+            return None
+        start = date.fromisoformat(self.start_date)
+        return (start + timedelta(days=round_num * max(0, self.days_per_round))).isoformat()
 
 
 @dataclass
@@ -107,6 +119,12 @@ class SwarmOrchestrator:
 
     def create_simulation(self, config: SimulationConfig) -> str:
         """Create a new simulation and return its ID."""
+        if config.start_date:
+            # Validate early (ValueError) including the last round's date.
+            try:
+                config.round_date(max(0, config.max_rounds))
+            except OverflowError as exc:
+                raise ValueError("start_date + rounds * days_per_round is out of range") from exc
         sim_id = uuid.uuid4().hex[:12]
 
         self.simulations[sim_id] = {
@@ -127,6 +145,7 @@ class SwarmOrchestrator:
             event_type="SIMULATION_CREATED",
             description=f"Created simulation '{config.name}' with {config.num_agents} agents",
             metadata={"simulation_id": sim_id, "config": asdict(config)},
+            date=config.round_date(0),
         )
 
         self.logger.info("Created simulation %s: %s", sim_id, config.name)
@@ -220,7 +239,9 @@ class SwarmOrchestrator:
                     "rounds": result.rounds_completed,
                     "metrics": result.metrics,
                 },
+                date=config.round_date(max(0, result.rounds_completed - 1)),
             )
+            self._flush_memory()
 
             return result
 
@@ -242,6 +263,7 @@ class SwarmOrchestrator:
             sim["agents"].append(agent.id)
             self.agents[agent.id] = agent
             agent.simulation_id = sim_id
+            agent.current_date = config.round_date(0)
             await agent.initialize(config.seed_data)
 
     async def _execute_round(self, sim_id: str, round_num: int) -> None:
@@ -252,10 +274,12 @@ class SwarmOrchestrator:
         if not agents:
             return
 
-        # Provide each agent a view of its peers so it can pick targets.
+        # Provide each agent a view of its peers and the simulated date.
         peer_ids = [a.id for a in agents]
+        today = sim["config"].round_date(round_num)
         for agent in agents:
             agent.set_peers(peer_ids)
+            agent.current_date = today
 
         # Decide actions in parallel — each agent can think independently.
         actions = await asyncio.gather(*(agent.decide_action() for agent in agents))
@@ -265,6 +289,17 @@ class SwarmOrchestrator:
             await agent.execute_action(action)
 
         await self._update_shared_state(sim_id, list(zip(peer_ids, actions)))
+        # One dated vault note per round keeps events searchable without a
+        # file per event.
+        self._flush_memory()
+
+    def _flush_memory(self) -> None:
+        flush = getattr(self.memory, "flush", None)
+        if callable(flush):
+            try:
+                flush()
+            except Exception as exc:  # memory is best-effort
+                self.logger.warning("memory flush failed: %s", exc)
 
     async def _update_shared_state(self, sim_id: str, actions: List[tuple]) -> None:
         """Hook for subclasses to update simulation-wide state from a round."""

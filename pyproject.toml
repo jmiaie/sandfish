@@ -28,11 +28,15 @@ dependencies = [
     "fastapi>=0.100.0",
     "uvicorn[standard]>=0.23.0",
     "pydantic>=2.0.0",
-    "ompa>=0.3.0",
+    "ompa>=1.1.1,<2",
     "python-dotenv>=1.0.0",
 ]
 
 [project.optional-dependencies]
+# Embedding-backed hybrid search (downloads a sentence-transformers model).
+semantic = ["ompa[semantic]>=1.1.1,<2"]
+# Optional LLM agent providers (Anthropic, Gemini, OpenRouter) over HTTP.
+llm = ["httpx>=0.24.0"]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",

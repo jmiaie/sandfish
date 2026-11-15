@@ -1,7 +1,9 @@
 """OMPA-backed memory adapter."""
 
 from .ompa_adapter import (
+    INTERACTION_PREDICATES,
     Entity,
+    Fact,
     OMPAMemoryAdapter,
     SearchResult,
     create_memory_adapter,
@@ -9,7 +11,9 @@ from .ompa_adapter import (
 )
 
 __all__ = [
+    "INTERACTION_PREDICATES",
     "Entity",
+    "Fact",
     "OMPAMemoryAdapter",
     "SearchResult",
     "create_memory_adapter",

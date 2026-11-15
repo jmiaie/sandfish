@@ -104,6 +104,51 @@ Environment variables (see `.env.example` for the full list):
 Leaving `SANDFISH_API_KEY` unset disables auth — fine for local work, **not**
 fine for anything exposed to a network.
 
+## Memory (OMPA 1.1)
+
+SandFish requires `ompa>=1.1.1,<2` and uses it for real:
+
+- **Events** are batched (one dated note per simulated day/round) via
+  `Ompa.write(..., date=)`, so `memory.search()` returns hits (offline BM25 by
+  default; hybrid embeddings with `pip install 'sandfish[semantic]'`).
+- **Temporal ranking** is on: pass `start_date` (API/config) or
+  `--start-date` (CLI) and each round is a simulated day, so queries like
+  "what did agent_3 do yesterday" rank by the simulation's calendar.
+- **Interactions** (follow / like / comment / repost) are dated
+  knowledge-graph facts (`kg_add(valid_from=)`); `memory.get_interactions(id,
+  as_of=...)` answers "who engaged with me, as of round N".
+- **Memory drives behaviour:** bundled agents pick targets with a
+  per-type `RECIPROCITY` (default 0.5, influencer 0.3, lurker 0.8) that
+  prefers peers who previously engaged them, read from those facts.
+  Set `agent.reciprocity = 0` for the old uniform-random targeting.
+
+Set `SANDFISH_OMPA_SEMANTIC=0` to force offline keyword search.
+
+## LLM agents (optional, off by default)
+
+Bundled agents are heuristic and make no network calls. To let an LLM
+choose actions with schema-constrained structured output:
+
+```bash
+pip install '.[llm]'
+export SANDFISH_LLM_PROVIDER=anthropic   # or gemini | openrouter | mock
+export ANTHROPIC_API_KEY=...             # GEMINI_API_KEY / OPENROUTER_API_KEY
+sandfish orchestrator --agents 6 --rounds 5 --agent-types llm,default \
+  --llm-max-calls 30
+```
+
+- Provider-neutral `LLMClient` protocol (`sandfish/llm/base.py`); clients for
+  Anthropic (forced tool use, default `claude-sonnet-5-5`), Gemini
+  (`responseJsonSchema`, default `gemini-3.5-flash-lite`) and OpenRouter
+  (strict `json_schema`, default `anthropic/claude-sonnet-5.5`). Override
+  with `SANDFISH_LLM_MODEL`.
+- The decision schema constrains `action` to the action enum and `target`
+  to visible peers, so models can't invent agents.
+- Hard call budget (`--llm-max-calls`), retries on 429/5xx, and a
+  heuristic fallback on any error; keys are read from the environment and
+  redacted from errors.
+- `MockLLMClient` (`--llm-provider mock`) for tests and dry runs.
+
 ## Docker
 
 ```bash
