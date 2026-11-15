@@ -4,15 +4,15 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sandfish"
-version = "0.1.0"
-description = "Local-first multi-agent swarm simulation engine with OMPA-backed memory"
+version = "0.2.0"
+description = "Multi-agent simulation platform with OMPA memory, a FastAPI service, an MCP server, and optional LLM agents"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
 authors = [
-    {name = "Jarv", email = "jarv@micap.ai"}
+    {name = "Jeff Milam"}
 ]
-keywords = ["multi-agent", "swarm", "simulation", "ai", "omp"]
+keywords = ["multi-agent", "swarm", "simulation", "ai", "ompa", "mcp", "fastapi", "llm-agents"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -59,6 +59,8 @@ sandfish-mcp = "sandfish.mcp_server:main"
 Homepage = "https://github.com/jmiaie/sandfish"
 Repository = "https://github.com/jmiaie/sandfish"
 Documentation = "https://github.com/jmiaie/sandfish#readme"
+Changelog = "https://github.com/jmiaie/sandfish/blob/main/CHANGELOG.md"
+Issues = "https://github.com/jmiaie/sandfish/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["sandfish"]

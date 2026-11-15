@@ -63,6 +63,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from .. import __version__
 from ..core.orchestrator import (
     SimulationConfig,
     SimulationLimitError,
@@ -378,7 +379,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="SandFish API",
     description="Multi-agent swarm intelligence simulation platform",
-    version="0.1.0",
+    version=__version__,
     lifespan=lifespan,
 )
 
