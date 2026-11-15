@@ -71,6 +71,12 @@ class CreateSimulationRequest(BaseModel):
     num_agents: int = Field(default=10, ge=1, le=10_000)
     agent_types: List[str] = Field(default_factory=lambda: ["default"])
     seed_data: Dict[str, Any] = Field(default_factory=dict)
+    start_date: Optional[str] = Field(
+        default=None,
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+        description="Simulated date of round 0 (YYYY-MM-DD); dates memory writes.",
+    )
+    days_per_round: int = Field(default=1, ge=0, le=365)
 
 
 class SimulationResponse(BaseModel):
@@ -330,8 +336,13 @@ async def create_simulation(request: CreateSimulationRequest) -> SimulationRespo
         num_agents=request.num_agents,
         agent_types=request.agent_types,
         seed_data=request.seed_data,
+        start_date=request.start_date,
+        days_per_round=request.days_per_round,
     )
-    sim_id = orch.create_simulation(config)
+    try:
+        sim_id = orch.create_simulation(config)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return _status_to_response(orch, sim_id)
 
 

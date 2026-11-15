@@ -8,11 +8,12 @@ import random
 import secrets
 import uuid
 from abc import ABC, abstractmethod
-from collections import deque
+from collections import Counter, deque
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, Iterator, List, Mapping as TMapping, Optional, Tuple
 
 from ..memory.ompa_adapter import OMPAMemoryAdapter
 
@@ -89,6 +90,34 @@ class Action:
     timestamp: datetime = field(default_factory=_utcnow)
 
 
+# KG predicate recorded for each agent-targeted action.
+_INTERACTION_PREDICATE = {
+    ActionType.FOLLOW: "follows",
+    ActionType.LIKE_POST: "liked",
+    ActionType.COMMENT: "commented_on",
+    ActionType.REPOST: "reposted",
+}
+
+
+class _LazyContext(Mapping):
+    """Decision context whose memory lookups run only if a policy reads them."""
+
+    def __init__(self, eager: Dict[str, Any], lazy: Dict[str, Callable[[], Any]]):
+        self._values = dict(eager)
+        self._lazy = dict(lazy)
+
+    def __getitem__(self, key: str) -> Any:
+        if key not in self._values and key in self._lazy:
+            self._values[key] = self._lazy.pop(key)()
+        return self._values[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(list(self._values) + list(self._lazy))
+
+    def __len__(self) -> int:
+        return len(self._values) + len(self._lazy)
+
+
 # Energy costs by action type.
 _ENERGY_COSTS = {
     ActionType.CREATE_POST: 10.0,
@@ -114,6 +143,11 @@ class BaseAgent(ABC):
     # Subclasses can lower this to be more conservative with energy spending.
     LOW_ENERGY_THRESHOLD: float = 20.0
 
+    # Probability that a targeted action goes to a peer who previously
+    # engaged with this agent (read from OMPA interaction facts) instead of a
+    # uniformly random peer. 0 disables memory-driven targeting.
+    RECIPROCITY: float = 0.5
+
     def __init__(
         self,
         agent_id: str,
@@ -130,6 +164,12 @@ class BaseAgent(ABC):
 
         self.simulation_id: Optional[str] = None
         self.round_number: int = 0
+        # Simulation calendar date (YYYY-MM-DD) set by the orchestrator each
+        # round; used to date memory writes. None means "today".
+        self.current_date: Optional[str] = None
+        self.reciprocity: float = self.RECIPROCITY
+        self._engaged_cache: Optional[Tuple[int, "Counter[str]"]] = None
+        self.memory_targeted_actions: int = 0
 
         # Bounded action log. Use a deque so old entries drop in O(1).
         self.action_history: Deque[Action] = deque(maxlen=history_limit)
@@ -145,10 +185,11 @@ class BaseAgent(ABC):
 
         if self.memory is not None:
             self.memory.add_entity(
-                name=self.profile.name,
+                name=self.id,
                 entity_type=self.profile.agent_type,
+                valid_from=self.current_date,
                 attributes={
-                    "agent_id": self.id,
+                    "display_name": self.profile.name,
                     "traits": self.profile.traits,
                     "backstory": self.profile.backstory,
                     "goals": self.profile.goals,
@@ -198,6 +239,15 @@ class BaseAgent(ABC):
         handler = self._action_handler(action.action_type)
         await handler(action)
 
+        predicate = _INTERACTION_PREDICATE.get(action.action_type)
+        if predicate and action.target and self.memory is not None:
+            try:
+                self.memory.record_interaction(
+                    self.id, predicate, action.target, date=self.current_date
+                )
+            except Exception:
+                pass  # memory is best-effort; never break the round
+
         self.action_history.append(action)
         self.state.energy = max(0.0, self.state.energy - _ENERGY_COSTS.get(action.action_type, 5.0))
         self.round_number += 1
@@ -235,34 +285,80 @@ class BaseAgent(ABC):
 
     # ----- Internal helpers -----
 
-    def _gather_context(self) -> Dict[str, Any]:
-        """Gather context from memory and current state."""
-        memories: List[Any] = []
-        related: List[Any] = []
+    def _gather_context(self) -> Mapping:
+        """Decision context. Memory lookups are lazy: they only run (and
+        cost anything) if a policy actually reads ``memories``,
+        ``related_entities`` or ``engaged_peers``."""
+        return _LazyContext(
+            eager={
+                "current_state": self.state,
+                "round": self.round_number,
+                "date": self.current_date,
+                "peers": list(self._peers),
+            },
+            lazy={
+                "memories": self._recall_memories,
+                "related_entities": self._recall_related,
+                "engaged_peers": lambda: dict(self._engaged_peers()),
+            },
+        )
+
+    def _recall_memories(self) -> List[Any]:
+        if self.memory is None:
+            return []
+        try:
+            hits = self.memory.search(
+                query=f"{self.id} {self.profile.name}", limit=5,
+                reference_date=self.current_date,
+            )
+            return list(hits) if isinstance(hits, list) else []
+        except Exception:
+            return []
+
+    def _recall_related(self) -> List[Any]:
+        if self.memory is None:
+            return []
+        try:
+            related = self.memory.get_related_entities(self.id)
+            return list(related) if isinstance(related, list) else []
+        except Exception:
+            return []
+
+    def _engaged_peers(self) -> "Counter[str]":
+        """Peers who have engaged with this agent, with counts (cached per round)."""
+        if self._engaged_cache is not None and self._engaged_cache[0] == self.round_number:
+            return self._engaged_cache[1]
+        counts: "Counter[str]" = Counter()
         if self.memory is not None:
             try:
-                memories = self.memory.search(
-                    query=f"agent {self.profile.name} recent actions",
-                    limit=5,
+                facts = self.memory.get_interactions(
+                    self.id, direction="incoming", as_of=self.current_date
                 )
-                related = self.memory.get_related_entities(self.profile.name)
+                if isinstance(facts, list):
+                    counts.update(f.subject for f in facts)
             except Exception:
-                # Memory backends are best-effort during decision-making.
-                memories, related = [], []
+                counts = Counter()
+        self._engaged_cache = (self.round_number, counts)
+        return counts
 
-        return {
-            "memories": memories,
-            "related_entities": related,
-            "current_state": self.state,
-            "round": self.round_number,
-            "peers": list(self._peers),
-        }
+    def _choose_target(self) -> Optional[str]:
+        """Pick a peer; with probability ``reciprocity`` prefer peers who
+        engaged with us before (weighted by how often), else uniform."""
+        if not self._peers:
+            return None
+        if self.memory is not None and self.reciprocity > 0 and random.random() < self.reciprocity:
+            engaged = self._engaged_peers()
+            candidates = [p for p in self._peers if engaged.get(p)]
+            if candidates:
+                self.memory_targeted_actions += 1
+                weights = [engaged[p] for p in candidates]
+                return random.choices(candidates, weights=weights)[0]
+        return random.choice(self._peers)
 
     def _enrich_action(self, action: Action) -> Action:
         """Fill in target/content for actions that need them."""
         if action.action_type in _AGENT_TARGETED_ACTIONS and not action.target:
-            if self._peers:
-                action.target = random.choice(self._peers)
+            action.target = self._choose_target()
 
         if action.action_type == ActionType.CREATE_POST and not action.content:
             content = self._generate_post_content()
@@ -296,7 +392,7 @@ class BaseAgent(ABC):
         return handlers.get(action_type, self._action_custom)
 
     @abstractmethod
-    def _select_action(self, context: Dict[str, Any]) -> Action:
+    def _select_action(self, context: TMapping[str, Any]) -> Action:
         """Select an action type given the gathered context."""
 
     def _log_event(self, event_type: str, metadata: Dict[str, Any]) -> None:
@@ -305,12 +401,21 @@ class BaseAgent(ABC):
         try:
             self.memory.record_event(
                 event_type=event_type,
-                description=f"Agent {self.profile.name}: {event_type}",
+                description=self._describe_event(event_type, metadata),
                 metadata=metadata,
+                date=self.current_date,
             )
         except Exception:
             # Logging must never break the simulation loop.
             pass
+
+    def _describe_event(self, event_type: str, metadata: Dict[str, Any]) -> str:
+        """Human-readable, search-friendly event text."""
+        if event_type == "ACTION_EXECUTED":
+            verb = metadata.get("action_type", "acted")
+            target = metadata.get("target")
+            return f"{self.id} ({self.profile.name}) {verb}" + (f" -> {target}" if target else "")
+        return f"{self.id} ({self.profile.name}): {event_type}"
 
     # ----- Default action implementations -----
 
@@ -350,7 +455,7 @@ class BaseAgent(ABC):
 class DefaultAgent(BaseAgent):
     """Balanced agent with broad action distribution."""
 
-    def _select_action(self, context: Dict[str, Any]) -> Action:
+    def _select_action(self, context: TMapping[str, Any]) -> Action:
         actions = [
             ActionType.CREATE_POST,
             ActionType.LIKE_POST,
@@ -367,8 +472,9 @@ class InfluencerAgent(BaseAgent):
     """Prefers content creation and growing connections."""
 
     LOW_ENERGY_THRESHOLD = 15.0
+    RECIPROCITY = 0.3  # broadcasters engage widely
 
-    def _select_action(self, context: Dict[str, Any]) -> Action:
+    def _select_action(self, context: TMapping[str, Any]) -> Action:
         actions = [
             ActionType.CREATE_POST,
             ActionType.FOLLOW,
@@ -384,8 +490,9 @@ class LurkerAgent(BaseAgent):
     """Mostly observes; occasionally interacts."""
 
     LOW_ENERGY_THRESHOLD = 10.0
+    RECIPROCITY = 0.8  # lurkers mostly respond to people who engaged them
 
-    def _select_action(self, context: Dict[str, Any]) -> Action:
+    def _select_action(self, context: TMapping[str, Any]) -> Action:
         actions = [
             ActionType.DO_NOTHING,
             ActionType.SEARCH,
@@ -395,6 +502,17 @@ class LurkerAgent(BaseAgent):
         ]
         weights = [0.5, 0.25, 0.15, 0.07, 0.03]
         return Action(action_type=random.choices(actions, weights=weights)[0])
+
+
+def _default_agent_name(agent_id: str) -> str:
+    """Readable, per-simulation-unique default name.
+
+    Orchestrator IDs look like ``<sim_id>_agent_<i>``; the old
+    ``agent_id[:4]`` took the sim prefix, so every agent shared one name.
+    """
+    if "_agent_" in agent_id:
+        return f"Agent_{agent_id.rsplit('_agent_', 1)[1]}"
+    return f"Agent_{agent_id[:8]}"
 
 
 # Agent factory registry.
@@ -420,7 +538,7 @@ def create_agent(
     agent_id = agent_id or f"agent_{uuid.uuid4().hex[:8]}"
 
     profile = AgentProfile(
-        name=kwargs.get("name", f"Agent_{agent_id[:4]}"),
+        name=kwargs.get("name", _default_agent_name(agent_id)),
         agent_type=agent_type,
         traits=kwargs.get("traits", {}),
         preferences=kwargs.get("preferences", {}),

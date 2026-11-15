@@ -93,6 +93,10 @@ def _build_simulation_config(
         base["max_rounds"] = args.rounds
     if args.agents_set:
         base["num_agents"] = args.agents
+    if getattr(args, "start_date", None):
+        base["start_date"] = args.start_date
+    if getattr(args, "agent_types", None):
+        base["agent_types"] = [t.strip() for t in args.agent_types.split(",") if t.strip()]
 
     return SimulationConfig(**base)
 
@@ -114,6 +118,16 @@ def cmd_orchestrator(args: argparse.Namespace) -> int:
         config_data = _load_config_file(config_path)
 
     config = _build_simulation_config(args, config_data)
+    llm_budget = None
+    if "llm" in config.agent_types:
+        # Opt-in only: provider from --llm-provider or SANDFISH_LLM_PROVIDER.
+        from .llm import client_from_env
+        from .llm.agent import enable_llm_agents
+
+        client = client_from_env(getattr(args, "llm_provider", None))
+        llm_budget = enable_llm_agents(client, max_calls=args.llm_max_calls)
+        label = f"{client.name}:{client.model}" if client is not None else "none (heuristic fallback)"
+        print(f"LLM agents: {label}, max {args.llm_max_calls} calls")
     orchestrator = create_orchestrator(args.vault, checkpoint_dir=args.checkpoint_dir)
     sim_id = orchestrator.create_simulation(config)
     print(f"Created simulation: {sim_id}")
@@ -130,6 +144,16 @@ def cmd_orchestrator(args: argparse.Namespace) -> int:
     print(f"  Status:   {result.status.value}")
     print(f"  Rounds:   {result.rounds_completed}")
     print(f"  Metrics:  {result.metrics}")
+    if llm_budget is not None:
+        fallbacks = sum(
+            getattr(orchestrator.agents.get(a), "llm_fallbacks", 0)
+            for a in orchestrator.simulations[sim_id]["agents"]
+        )
+        print(
+            f"  LLM:      {llm_budget.calls} calls, "
+            f"{llm_budget.input_tokens} in / {llm_budget.output_tokens} out tokens, "
+            f"{fallbacks} heuristic fallbacks"
+        )
     if result.error_message:
         print(f"  Error:    {result.error_message}")
         return 1
@@ -212,6 +236,23 @@ def _build_parser() -> argparse.ArgumentParser:
         "--checkpoint-dir",
         default=None,
         help="Directory to write per-round checkpoints (default: none)",
+    )
+    orch.add_argument(
+        "--start-date",
+        help="Simulated date of round 0 (YYYY-MM-DD); each round advances one day",
+    )
+    orch.add_argument(
+        "--agent-types",
+        help="Comma-separated agent types, e.g. default,lurker,llm ('llm' is opt-in)",
+    )
+    orch.add_argument(
+        "--llm-provider",
+        choices=["anthropic", "gemini", "openrouter", "mock"],
+        help="Provider for 'llm' agents (default: $SANDFISH_LLM_PROVIDER)",
+    )
+    orch.add_argument(
+        "--llm-max-calls", type=int, default=200,
+        help="Hard cap on LLM calls for the whole run (default: 200)",
     )
     orch.add_argument("--dry-run", action="store_true", help="Create the simulation but don't run it")
     orch.set_defaults(func=cmd_orchestrator)
