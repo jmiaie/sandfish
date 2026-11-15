@@ -42,14 +42,20 @@ For AegisFlow (stricter sandbox, lead/sub-agent delegation), see
 ## Install
 
 ```bash
-git clone <this-repo>
+pip install sandfish                 # core: engine, CLI, FastAPI service
+pip install "sandfish[mcp]"          # + the sandfish-mcp server
+pip install "sandfish[llm]"          # + Anthropic / Gemini / OpenRouter agents
+```
+
+From a checkout (for development, tests and audits):
+
+```bash
+git clone https://github.com/jmiaie/sandfish
 cd sandfish
-pip install .
-# for tests and audits:
 pip install -e '.[dev]'
 ```
 
-The package is not on PyPI yet, so install from source.
+Release notes are in [CHANGELOG.md](CHANGELOG.md).
 
 ## Quick start
 
@@ -213,8 +219,8 @@ inspect simulations. It uses stdio and the official Python MCP SDK, and its
 tool names take an `sf_` prefix, the same convention as OMPA's `ao_` tools.
 
 ```bash
-pip install -e '.[mcp]'            # from a checkout
-# or: pip install 'sandfish[mcp] @ git+https://github.com/jmiaie/sandfish'
+pip install "sandfish[mcp]"        # from PyPI
+# or, from a checkout: pip install -e '.[mcp]'
 sandfish-mcp --vault ./sandfish_vault
 ```
 

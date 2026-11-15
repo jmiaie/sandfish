@@ -1,12 +1,19 @@
 # Installation Guide
 
-SandFish runs on any platform with Python 3.10 or newer. It has no published
-PyPI release yet, so install from a local clone.
+SandFish runs on any platform with Python 3.10 or newer.
+
+## From PyPI
+
+```bash
+pip install sandfish            # core
+pip install "sandfish[mcp]"     # + sandfish-mcp (MCP server)
+pip install "sandfish[llm]"     # + LLM agent providers
+```
 
 ## From source
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/jmiaie/sandfish
 cd sandfish
 python -m venv .venv
 # Linux/macOS

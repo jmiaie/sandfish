@@ -69,10 +69,10 @@ A transparent, local-first sandbox for multi-agent simulations with:
 
 ## Current status
 
-- Version 0.1.0; MIT licensed.
-- Test suite runs green on Windows and Linux (54 tests, including
-  async + integration).
-- Not yet published to PyPI; install from source.
+- Version 0.2.0; MIT licensed.
+- CI runs `ruff check .` and the test suite (224 tests, including async,
+  API and MCP integration) on Linux, Python 3.12.
+- Published to PyPI as `sandfish` (`pip install "sandfish[mcp]"` for the MCP server).
 - No published Docker image; the Dockerfile and Compose file build locally.
 
 ## Links
