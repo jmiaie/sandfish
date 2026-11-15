@@ -21,7 +21,7 @@ than production workloads.
   types.
 - `OMPAMemoryAdapter` — thin wrapper over an OMPA vault, unified surface for
   events, entities, and retrieval.
-- FastAPI HTTP layer — REST + server-sent events; optional auth and rate
+- FastAPI HTTP layer — REST + WebSocket event stream; optional auth and rate
   limiting.
 - CLI — `sandfish orchestrator`, `sandfish api`, `sandfish security-audit`.
 

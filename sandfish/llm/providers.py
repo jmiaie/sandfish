@@ -21,7 +21,7 @@ import json
 import os
 from typing import Any, Dict, Optional
 
-from .base import LLMBudget, LLMError, redact
+from .base import LLMBudget, LLMBudgetExhausted, LLMError, record_usage, redact
 
 DEFAULT_MODELS = {
     "anthropic": "claude-sonnet-5-5",
@@ -78,7 +78,7 @@ class _HTTPClient:
     async def _post(self, url: str, headers: Dict[str, str], body: Dict[str, Any]) -> Dict[str, Any]:
         httpx = _import_httpx()
         if self.budget is not None and not self.budget.try_acquire():
-            raise LLMError("LLM call budget exhausted")
+            raise LLMBudgetExhausted("LLM call budget exhausted")
         resp = None
         async with self._sem:
             for attempt in range(self.max_retries + 1):
@@ -148,8 +148,7 @@ class AnthropicClient(_HTTPClient):
         }
         data = await self._post(f"{self.base_url}/messages", headers, body)
         usage = data.get("usage") or {}
-        if self.budget is not None:
-            self.budget.add_usage(usage.get("input_tokens", 0), usage.get("output_tokens", 0))
+        record_usage(self.budget, usage.get("input_tokens", 0), usage.get("output_tokens", 0))
         for block in data.get("content") or []:
             if block.get("type") == "tool_use" and isinstance(block.get("input"), dict):
                 decision: Dict[str, Any] = block["input"]
@@ -175,8 +174,7 @@ class GeminiClient(_HTTPClient):
         headers = {"x-goog-api-key": self._api_key or "", "content-type": "application/json"}
         data = await self._post(f"{self.base_url}/models/{self.model}:generateContent", headers, body)
         usage = data.get("usageMetadata") or {}
-        if self.budget is not None:
-            self.budget.add_usage(usage.get("promptTokenCount", 0), usage.get("candidatesTokenCount", 0))
+        record_usage(self.budget, usage.get("promptTokenCount", 0), usage.get("candidatesTokenCount", 0))
         try:
             parts = data["candidates"][0]["content"]["parts"]
             text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
@@ -211,8 +209,7 @@ class OpenRouterClient(_HTTPClient):
         }
         data = await self._post(f"{self.base_url}/chat/completions", headers, body)
         usage = data.get("usage") or {}
-        if self.budget is not None:
-            self.budget.add_usage(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+        record_usage(self.budget, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
         try:
             text = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError):

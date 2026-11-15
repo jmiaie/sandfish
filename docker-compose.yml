@@ -13,9 +13,10 @@ services:
     environment:
       OMPA_VAULT_PATH: /app/vault
       SANDFISH_ENV: production
-      # Set SANDFISH_API_KEY in your shell or .env file before running:
+      # Required: the container binds 0.0.0.0, and `sandfish api` refuses a
+      # non-loopback bind without a key. Set it in your shell or .env file:
       #   SANDFISH_API_KEY=$(openssl rand -hex 32) docker compose up
-      SANDFISH_API_KEY: ${SANDFISH_API_KEY:-}
+      SANDFISH_API_KEY: ${SANDFISH_API_KEY:?set SANDFISH_API_KEY (see comment above)}
     restart: unless-stopped
     healthcheck:
       test:

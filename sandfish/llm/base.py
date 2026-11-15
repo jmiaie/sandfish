@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Protocol, Sequence, runtime_checkable
@@ -11,6 +12,10 @@ NO_TARGET = "none"
 
 class LLMError(RuntimeError):
     """Raised by clients for transport, auth, budget, or schema failures."""
+
+
+class LLMBudgetExhausted(LLMError):
+    """Raised by a client that refused a call before sending it."""
 
 
 @runtime_checkable
@@ -51,10 +56,32 @@ class LLMBudget:
             self.calls += 1
             return True
 
+    def release(self) -> None:
+        """Refund one acquired call that was not actually made."""
+        with self._lock:
+            self.calls = max(0, self.calls - 1)
+
     def add_usage(self, input_tokens: int = 0, output_tokens: int = 0) -> None:
         with self._lock:
             self.input_tokens += int(input_tokens or 0)
             self.output_tokens += int(output_tokens or 0)
+
+
+# Extra budget that HTTP clients also report token usage to: LLMAgent sets it
+# to the calling simulation's budget around each call, so per-simulation
+# token tallies work with a client shared across simulations.
+usage_sink: "contextvars.ContextVar[Optional[LLMBudget]]" = contextvars.ContextVar(
+    "sandfish_llm_usage_sink", default=None
+)
+
+
+def record_usage(own: Optional[LLMBudget], input_tokens: int, output_tokens: int) -> None:
+    """Add token usage to a client's own budget and the active usage sink."""
+    if own is not None:
+        own.add_usage(input_tokens, output_tokens)
+    sink = usage_sink.get()
+    if sink is not None and sink is not own:
+        sink.add_usage(input_tokens, output_tokens)
 
 
 def action_schema(actions: Sequence[str], peers: Sequence[str]) -> Dict[str, Any]:

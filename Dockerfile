@@ -62,4 +62,7 @@ sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).
 
 EXPOSE 8000
 
+# Binding 0.0.0.0 requires SANDFISH_API_KEY at runtime (the server refuses to
+# start without it), e.g. `docker run -e SANDFISH_API_KEY=... -p 8000:8000`.
+
 CMD ["sandfish", "api", "--host", "0.0.0.0", "--port", "8000", "--vault", "/app/vault"]

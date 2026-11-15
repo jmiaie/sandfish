@@ -12,27 +12,40 @@ Endpoints:
 - POST /api/simulations/{id}/stop    request a stop
 - GET  /api/simulations/{id}/agents  list agent state
 - GET  /api/simulations/{id}/results latest results
-- POST /api/security/audit           run security auditor (auth required)
+- POST /api/security/audit           run the security auditor on the
+                                     installed sandfish package (auth required)
 - WS   /ws                           real-time event stream
 
 Auth:
-- If SANDFISH_API_KEY is set, all /api/* endpoints require an
-  `X-API-Key` header that matches. /health and /ws are unauthenticated.
+- If SANDFISH_API_KEY is set, all /api/* endpoints require an `X-API-Key`
+  header that matches, and /ws requires the key (see websocket_endpoint).
+  /health is always open.
+- `sandfish api` binds 127.0.0.1 by default and refuses a non-loopback bind
+  unless SANDFISH_API_KEY is set.
+- Failed auth attempts are rate-limited per client IP
+  (SANDFISH_AUTH_FAILURES_PER_MINUTE, default 10) before the key is checked.
 
 Rate limiting:
 - Per-client (X-API-Key or remote IP) sliding window.
 - Configurable via SANDFISH_RATE_LIMIT_PER_MINUTE (default: 120).
+
+Resource limits (0 = unlimited): SANDFISH_MAX_AGENTS (1000),
+SANDFISH_MAX_ROUNDS (10000), SANDFISH_MAX_CONCURRENT_SIMULATIONS (4),
+SANDFISH_MAX_FINISHED_SIMULATIONS (100, oldest finished are evicted).
 """
 
 from __future__ import annotations
 
 import asyncio
+import ipaddress
+import logging
 import os
 import secrets
 import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 
 from fastapi import (
@@ -51,10 +64,22 @@ from pydantic import BaseModel, Field
 
 from ..core.orchestrator import (
     SimulationConfig,
+    SimulationLimitError,
+    SimulationLimits,
+    SimulationStatus,
     SwarmOrchestrator,
 )
 from ..memory.ompa_adapter import OMPAMemoryAdapter
 from ..security.audit import run_security_audit
+
+logger = logging.getLogger("sandfish.api")
+
+# Seconds a WebSocket client has to send {"command": "auth", ...} when it
+# didn't present the key in a header, and how many such not-yet-authenticated
+# sockets may wait at once.
+WS_AUTH_TIMEOUT_S = 10.0
+WS_MAX_PENDING_AUTH = 32
+_ws_pending_auth = 0
 
 
 def _utcnow_iso() -> str:
@@ -90,6 +115,7 @@ class SimulationResponse(BaseModel):
     current_round: int
     total_rounds: int
     num_agents: int
+    rounds_completed: int = 0
     start_time: Optional[str] = None
     end_time: Optional[str] = None
     error: Optional[str] = None
@@ -132,19 +158,53 @@ def _api_key_setting() -> Optional[str]:
     return key.strip() if key and key.strip() else None
 
 
-async def require_api_key(request: Request) -> str:
-    """FastAPI dependency that enforces SANDFISH_API_KEY when configured."""
-    expected = _api_key_setting()
-    if expected is None:
-        return "anonymous"
+def _keys_match(provided: Optional[str], expected: str) -> bool:
+    """Constant-time compare that never raises.
 
-    provided = request.headers.get("x-api-key")
-    if not provided or not secrets.compare_digest(provided, expected):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing X-API-Key header.",
+    secrets.compare_digest raises TypeError for non-ASCII *str* input, which
+    surfaced as a 500; comparing bytes handles any value. Starlette decodes
+    header bytes as latin-1, so a UTF-8 key sent in a header is recovered by
+    re-encoding as latin-1; keys from JSON (WebSocket auth message) are real
+    text and compare as UTF-8.
+    """
+    if not provided:
+        return False
+    want = expected.encode("utf-8")
+    candidates = [provided.encode("utf-8", "surrogatepass")]
+    try:
+        candidates.append(provided.encode("latin-1"))
+    except UnicodeEncodeError:
+        pass
+    matched = False
+    for candidate in candidates:
+        matched |= secrets.compare_digest(candidate, want)
+    return matched
+
+
+def is_loopback_host(host: str) -> bool:
+    """True for localhost / 127.0.0.0/8 / ::1 binds."""
+    host = (host or "").strip().strip("[]")
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def check_bind_allowed(host: str) -> None:
+    """Refuse to serve on a non-loopback address without an API key."""
+    if not is_loopback_host(host) and _api_key_setting() is None:
+        raise RuntimeError(
+            f"Refusing to bind {host!r} without SANDFISH_API_KEY: the API would be "
+            "reachable unauthenticated from the network. Set SANDFISH_API_KEY "
+            "(e.g. `export SANDFISH_API_KEY=$(openssl rand -hex 32)`) or bind 127.0.0.1."
         )
-    return provided
+
+
+def _client_ip(conn: Any) -> str:
+    client = getattr(conn, "client", None)
+    return client.host if client else "unknown"
 
 
 class _SlidingWindowLimiter:
@@ -155,14 +215,36 @@ class _SlidingWindowLimiter:
         self.window_seconds = 60.0
         self._hits: Dict[str, Deque[float]] = defaultdict(deque)
         self._lock = asyncio.Lock()
+        self._last_sweep = float("-inf")
+
+    def _trim(self, key: str, now: float) -> Deque[float]:
+        bucket = self._hits[key]
+        cutoff = now - self.window_seconds
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        return bucket
+
+    max_keys = 10_000
+
+    def _evict_idle(self, now: float) -> None:
+        # Keep memory bounded when many distinct clients/keys show up: drop
+        # idle buckets at most once per window, then (if a flood of fresh
+        # keys is still over the cap) the oldest ones. dicts keep insertion
+        # order, so the first keys are the oldest.
+        if len(self._hits) <= self.max_keys:
+            return
+        if now - self._last_sweep >= self.window_seconds:
+            self._last_sweep = now
+            cutoff = now - self.window_seconds
+            for k in [k for k, b in self._hits.items() if not b or b[-1] < cutoff]:
+                del self._hits[k]
+        while len(self._hits) > self.max_keys:
+            del self._hits[next(iter(self._hits))]
 
     async def check(self, key: str) -> None:
         now = time.monotonic()
         async with self._lock:
-            bucket = self._hits[key]
-            cutoff = now - self.window_seconds
-            while bucket and bucket[0] < cutoff:
-                bucket.popleft()
+            bucket = self._trim(key, now)
             if len(bucket) >= self.max:
                 retry = max(0.0, self.window_seconds - (now - bucket[0]))
                 raise HTTPException(
@@ -170,16 +252,72 @@ class _SlidingWindowLimiter:
                     detail=f"Rate limit exceeded. Retry in {retry:.1f}s.",
                 )
             bucket.append(now)
+            self._evict_idle(now)
+
+    async def blocked(self, key: str) -> Optional[float]:
+        """Seconds until `key` may try again, or None if under the limit."""
+        now = time.monotonic()
+        async with self._lock:
+            bucket = self._trim(key, now)
+            if len(bucket) >= self.max:
+                return max(0.0, self.window_seconds - (now - bucket[0]))
+            return None
+
+    async def record(self, key: str) -> None:
+        now = time.monotonic()
+        async with self._lock:
+            self._trim(key, now).append(now)
+            self._evict_idle(now)
 
 
 _limiter = _SlidingWindowLimiter(
     max_per_minute=int(os.environ.get("SANDFISH_RATE_LIMIT_PER_MINUTE", "120"))
 )
+# Failed authentications per client IP. Checked *before* the key compare, so
+# key guessing is throttled even though every guess is a distinct "client".
+_auth_fail_limiter = _SlidingWindowLimiter(
+    max_per_minute=int(os.environ.get("SANDFISH_AUTH_FAILURES_PER_MINUTE", "10"))
+)
+
+
+async def _authenticate(conn: Any, provided: Optional[str]) -> bool:
+    """Check `provided` against the configured key with failure throttling.
+
+    Returns True when auth is off or the key matches. Raises HTTPException
+    429 while the client IP is over its failed-attempt budget.
+    """
+    expected = _api_key_setting()
+    if expected is None:
+        return True
+    ip = _client_ip(conn)
+    retry = await _auth_fail_limiter.blocked(ip)
+    if retry is not None:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Too many failed authentication attempts. Retry in {retry:.1f}s.",
+        )
+    if _keys_match(provided, expected):
+        return True
+    await _auth_fail_limiter.record(ip)
+    return False
+
+
+async def require_api_key(request: Request) -> str:
+    """FastAPI dependency that enforces SANDFISH_API_KEY when configured."""
+    if _api_key_setting() is None:
+        return "anonymous"
+    provided = request.headers.get("x-api-key")
+    if not await _authenticate(request, provided):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing X-API-Key header.",
+        )
+    return provided or ""
 
 
 async def rate_limit(request: Request, _api_key: str = Depends(require_api_key)) -> None:
     """FastAPI dependency: applies rate limit after auth."""
-    key = _api_key if _api_key != "anonymous" else (request.client.host if request.client else "unknown")
+    key = _api_key if _api_key != "anonymous" else _client_ip(request)
     await _limiter.check(key)
 
 
@@ -201,11 +339,12 @@ async def lifespan(app: FastAPI):
 
     vault_path = _resolve_vault_path(app)
     memory = OMPAMemoryAdapter(vault_path)
-    orchestrator = SwarmOrchestrator(memory)
+    orchestrator = SwarmOrchestrator(memory, limits=SimulationLimits.from_env())
     orchestrator.on_event(_broadcast_event)
 
     # Track in-flight simulation tasks so we can cancel cleanly on shutdown.
-    app.state.simulation_tasks: Dict[str, asyncio.Task] = {}
+    app.state.simulation_tasks = {}  # Dict[str, asyncio.Task]
+    app.state.audit_lock = asyncio.Lock()
 
     yield
 
@@ -218,6 +357,7 @@ async def lifespan(app: FastAPI):
         await asyncio.gather(
             *app.state.simulation_tasks.values(), return_exceptions=True
         )
+        await asyncio.to_thread(orchestrator.close)
 
     async with _websocket_lock:
         for ws in list(_websocket_clients):
@@ -305,6 +445,50 @@ def _require_orchestrator() -> SwarmOrchestrator:
     return orchestrator
 
 
+def _on_run_done(sim_id: str, task: "asyncio.Task[Any]") -> None:
+    """Log background run failures instead of dropping them silently."""
+    if task.cancelled():
+        logger.info("Simulation %s run task cancelled", sim_id)
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(
+            "Simulation %s background run failed: %s",
+            sim_id,
+            exc,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        return
+    result = task.result()
+    if getattr(result, "error_message", None):
+        logger.error(
+            "Simulation %s ended %s: %s",
+            sim_id,
+            result.status.value,
+            result.error_message,
+        )
+
+
+def _spawn_run(request: Request, orch: SwarmOrchestrator, sim_id: str) -> None:
+    """Claim a run slot synchronously, then run in a background task."""
+    tasks: Dict[str, asyncio.Task] = request.app.state.simulation_tasks
+    # Forget finished tasks (and evicted simulations) so the map stays bounded.
+    for sid in [sid for sid, t in tasks.items() if t.done()]:
+        del tasks[sid]
+    existing = tasks.get(sim_id)
+    if existing is not None and not existing.done():
+        raise HTTPException(status_code=409, detail="Simulation is already running")
+    try:
+        orch.reserve_start(sim_id)
+    except SimulationLimitError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    task = asyncio.create_task(orch.run_simulation(sim_id))
+    tasks[sim_id] = task
+    task.add_done_callback(lambda t: _on_run_done(sim_id, t))
+
+
 def _status_to_response(orch: SwarmOrchestrator, sim_id: str) -> SimulationResponse:
     status_dict = orch.get_simulation_status(sim_id)
     if status_dict is None:
@@ -346,6 +530,8 @@ async def create_simulation(request: CreateSimulationRequest) -> SimulationRespo
     )
     try:
         sim_id = orch.create_simulation(config)
+    except SimulationLimitError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return _status_to_response(orch, sim_id)
@@ -380,29 +566,15 @@ async def get_simulation(sim_id: str) -> SimulationResponse:
     tags=["simulations"],
 )
 async def start_simulation(sim_id: str, request: Request) -> Dict[str, str]:
-    """Start a simulation. Returns 409 if already running."""
+    """Start a pending simulation.
+
+    409 if it isn't pending (running, pausing, paused -> use /resume, or
+    finished); 429 if the concurrent-simulation cap is reached.
+    """
     orch = _require_orchestrator()
     if sim_id not in orch.simulations:
         raise HTTPException(status_code=404, detail="Simulation not found")
-
-    tasks: Dict[str, asyncio.Task] = request.app.state.simulation_tasks
-    existing = tasks.get(sim_id)
-    if existing and not existing.done():
-        raise HTTPException(status_code=409, detail="Simulation is already running")
-
-    task = asyncio.create_task(orch.run_simulation(sim_id))
-    tasks[sim_id] = task
-
-    def _on_done(t: asyncio.Task) -> None:
-        # Surface failures via logs; preserve task object for inspection.
-        if t.cancelled():
-            return
-        exc = t.exception()
-        if exc is not None:
-            # Logged at orchestrator level too; don't crash here.
-            pass
-
-    task.add_done_callback(_on_done)
+    _spawn_run(request, orch, sim_id)
     return {"status": "started", "simulation_id": sim_id}
 
 
@@ -418,7 +590,8 @@ async def pause_simulation(sim_id: str) -> Dict[str, str]:
         raise HTTPException(status_code=404, detail="Simulation not found")
     if not orch.pause_simulation(sim_id):
         raise HTTPException(status_code=409, detail="Simulation is not running")
-    return {"status": "paused", "simulation_id": sim_id}
+    # The in-flight round finishes first; poll status until "paused".
+    return {"status": "pausing", "simulation_id": sim_id}
 
 
 @app.post(
@@ -427,16 +600,35 @@ async def pause_simulation(sim_id: str) -> Dict[str, str]:
     tags=["simulations"],
 )
 async def resume_simulation(sim_id: str, request: Request) -> Dict[str, str]:
-    """Resume a paused simulation by spawning a new run loop."""
+    """Resume a paused simulation from its next unexecuted round.
+
+    If the pause hasn't taken effect yet (status "pausing"), the pause is
+    cancelled and the existing run loop continues; no second loop starts.
+    """
     orch = _require_orchestrator()
     if sim_id not in orch.simulations:
         raise HTTPException(status_code=404, detail="Simulation not found")
+    sim = orch.simulations[sim_id]
+    if sim["status"] == SimulationStatus.PAUSED:
+        # Check the concurrency cap before un-pausing, so a 429 leaves the
+        # simulation paused rather than stranded in "pending".
+        cap = orch.limits.max_concurrent
+        if cap is not None and orch.active_count(exclude=sim_id) >= cap:
+            raise HTTPException(
+                status_code=429,
+                detail=f"{cap} simulation(s) already running; the limit is {cap}",
+            )
+    was_paused = sim["status"] == SimulationStatus.PAUSED
     if not orch.resume_simulation(sim_id):
         raise HTTPException(status_code=409, detail="Simulation is not paused")
-
-    tasks: Dict[str, asyncio.Task] = request.app.state.simulation_tasks
-    task = asyncio.create_task(orch.run_simulation(sim_id))
-    tasks[sim_id] = task
+    if sim["status"] == SimulationStatus.RUNNING:
+        return {"status": "running", "simulation_id": sim_id}
+    try:
+        _spawn_run(request, orch, sim_id)
+    except HTTPException:
+        if was_paused and sim["status"] == SimulationStatus.PENDING:
+            sim["status"] = SimulationStatus.PAUSED  # don't strand it in pending
+        raise
     return {"status": "resumed", "simulation_id": sim_id}
 
 
@@ -505,7 +697,7 @@ async def get_simulation_results(sim_id: str) -> SimulationResultResponse:
     return SimulationResultResponse(
         simulation_id=sim_id,
         status=sim["status"].value,
-        rounds_completed=sim["current_round"],
+        rounds_completed=orch._rounds_completed(sim),
         metrics=metrics,
         start_time=(sim["start_time"] or datetime.now(timezone.utc)).isoformat(),
         end_time=sim["end_time"].isoformat() if sim["end_time"] else None,
@@ -518,9 +710,17 @@ async def get_simulation_results(sim_id: str) -> SimulationResultResponse:
     dependencies=[Depends(rate_limit)],
     tags=["security"],
 )
-async def run_audit() -> Dict[str, Any]:
-    """Run the bundled security auditor against the working directory."""
-    findings = run_security_audit(".")
+async def run_audit(request: Request) -> Dict[str, Any]:
+    """Run the bundled security auditor on the installed sandfish package.
+
+    The scan root is fixed (never the server's CWD), runs in a worker thread
+    so the event loop keeps serving, and only one audit runs at a time.
+    """
+    lock: asyncio.Lock = request.app.state.audit_lock
+    if lock.locked():
+        raise HTTPException(status_code=409, detail="An audit is already running")
+    async with lock:
+        findings = await asyncio.to_thread(run_security_audit, str(_AUDIT_ROOT))
     return {
         "findings_count": len(findings),
         "critical": sum(1 for f in findings if f.severity == "CRITICAL"),
@@ -530,20 +730,120 @@ async def run_audit() -> Dict[str, Any]:
     }
 
 
+_AUDIT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _is_loopback_origin(origin: str) -> bool:
+    from urllib.parse import urlsplit
+
+    try:
+        host = urlsplit(origin).hostname or ""
+    except ValueError:
+        return False
+    return is_loopback_host(host)
+
+
+def _ws_origin_allowed(origin: Optional[str], *, auth_on: bool) -> bool:
+    """Origin policy for /ws.
+
+    No Origin header (non-browser client): allowed. SANDFISH_CORS_ORIGINS
+    set: the Origin must be listed. Otherwise: any origin when an API key is
+    required, loopback origins only when auth is off.
+    """
+    if not origin:
+        return True
+    allowed = _allowed_origins()
+    if allowed:
+        return origin in allowed or "*" in allowed
+    return auth_on or _is_loopback_origin(origin)
+
+
 # ---------- WebSocket ----------
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
-    """Real-time event stream. Optional API-key auth via query param `api_key`."""
+    """Real-time event stream.
+
+    When SANDFISH_API_KEY is set, present the key in one of these ways:
+
+    - an ``X-API-Key`` header on the upgrade request (non-browser clients);
+    - the first message after connecting:
+      ``{"command": "auth", "api_key": "..."}`` (browsers), within
+      WS_AUTH_TIMEOUT_S seconds;
+    - deprecated: ``?api_key=`` in the URL. Still accepted for backward
+      compatibility, but the key ends up in access logs and proxies.
+
+    Events are only delivered after authentication succeeds.
+    """
+    global _ws_pending_auth
     expected_key = _api_key_setting()
-    if expected_key is not None:
-        provided = websocket.query_params.get("api_key", "")
-        if not secrets.compare_digest(provided, expected_key):
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+    if not _ws_origin_allowed(websocket.headers.get("origin"), auth_on=expected_key is not None):
+        # Blocks cross-site WebSocket hijacking: browsers attach Origin, and
+        # without a key any page could otherwise read the local event stream.
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+    authed = expected_key is None
+    if not authed:
+        provided = websocket.headers.get("x-api-key")
+        if provided is None and "api_key" in websocket.query_params:
+            logger.warning(
+                "WebSocket key passed in the URL (?api_key=) is deprecated; "
+                "send an X-API-Key header or an auth message instead"
+            )
+            provided = websocket.query_params.get("api_key")
+        if provided is not None:
+            try:
+                ok = await _authenticate(websocket, provided)
+            except HTTPException:
+                ok = False
+            if not ok:
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                return
+            authed = True
+
+    if not authed:
+        if _ws_pending_auth >= WS_MAX_PENDING_AUTH:
+            await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
+            return
+        try:
+            if await _auth_fail_limiter.blocked(_client_ip(websocket)) is not None:
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                return
+        except Exception:
             return
 
     await websocket.accept()
+
+    if not authed:
+        _ws_pending_auth += 1
+        ok = False
+        try:
+            first = await asyncio.wait_for(
+                websocket.receive_json(), timeout=WS_AUTH_TIMEOUT_S
+            )
+            provided = first.get("api_key") if isinstance(first, dict) and first.get("command") == "auth" else None
+            if isinstance(provided, str):
+                ok = await _authenticate(websocket, provided)  # records failures
+            else:
+                await _auth_fail_limiter.record(_client_ip(websocket))
+        except HTTPException:
+            ok = False
+        except Exception:  # timeout, malformed frame, disconnect
+            ok = False
+            await _auth_fail_limiter.record(_client_ip(websocket))
+        finally:
+            _ws_pending_auth -= 1
+        if not ok:
+            try:
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            except Exception:
+                pass
+            return
+        await websocket.send_json(
+            {"type": "authenticated", "timestamp": _utcnow_iso(), "data": {}}
+        )
+
     async with _websocket_lock:
         _websocket_clients.append(websocket)
 
@@ -583,9 +883,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
     except WebSocketDisconnect:
         pass
-    except Exception:
+    except Exception as exc:
         # Don't crash the server on a single-client error.
-        pass
+        logger.debug("WebSocket client error: %s", exc)
     finally:
         async with _websocket_lock:
             if websocket in _websocket_clients:
@@ -616,5 +916,7 @@ def configure_app(vault_path: str = "./sandfish_vault", debug: bool = False) -> 
 if __name__ == "__main__":
     import uvicorn
 
+    host = os.environ.get("SANDFISH_HOST", "127.0.0.1")
+    check_bind_allowed(host)
     configure_app()
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host=host, port=int(os.environ.get("SANDFISH_PORT", "8000")))

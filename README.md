@@ -98,17 +98,33 @@ checkpointed, even when the round count is not a multiple of
 ### Run the HTTP API
 
 ```bash
-sandfish api --host 0.0.0.0 --port 8000 --vault ./sandfish_vault
+sandfish api --port 8000 --vault ./sandfish_vault          # binds 127.0.0.1
+# Network-facing: an API key is required, or the server refuses to start.
+SANDFISH_API_KEY=$(openssl rand -hex 32) sandfish api --host 0.0.0.0 --port 8000
 ```
 
 Available endpoints include:
 
 - `GET  /health` — liveness probe (no auth).
-- `POST /api/simulations` — create a simulation.
-- `POST /api/simulations/{id}/start` — run a simulation.
+- `POST /api/simulations` — create a simulation (unknown `agent_types` → 422).
+- `POST /api/simulations/{id}/start` — run a pending simulation.
 - `GET  /api/simulations/{id}` — status.
-- `POST /api/simulations/{id}/pause|resume|stop` — control.
-- `GET  /api/events` — server-sent events stream of orchestrator events.
+- `POST /api/simulations/{id}/pause|resume|stop` — control. A pause reports
+  `pausing` until the in-flight round finishes, then `paused`; resume
+  continues from the next round (no round is re-run).
+- `GET  /api/simulations/{id}/results` — rounds completed and metrics
+  (including per-simulation LLM calls/tokens when LLM agents are used).
+- `WS   /ws` — WebSocket stream of orchestrator events (`round_complete`, …).
+  With an API key set, authenticate with an `X-API-Key` header or by sending
+  `{"command": "auth", "api_key": "..."}` as the first message
+  (`?api_key=` in the URL still works but is deprecated: URLs end up in logs).
+  Browser connections must come from a loopback origin when auth is off, or
+  from `SANDFISH_CORS_ORIGINS` when that is set.
+
+Failed authentication is throttled per client IP (default 10 per minute, then
+429 for that IP, including requests with the right key). Behind a reverse
+proxy every client shares the proxy's IP, so run uvicorn with
+`--proxy-headers`/`--forwarded-allow-ips` or terminate auth at the proxy.
 
 ### Run the security auditor
 
@@ -127,11 +143,16 @@ Environment variables (see `.env.example` for the full list):
 | `OMPA_VAULT_PATH` | Directory for OMPA-backed memory | `./sandfish_vault` |
 | `SANDFISH_API_KEY` | If set, `/api/*` requires an `X-API-Key` header | unset (auth off) |
 | `SANDFISH_RATE_LIMIT_PER_MINUTE` | Sliding-window rate limit per key/IP | `120` |
+| `SANDFISH_AUTH_FAILURES_PER_MINUTE` | Failed auth attempts allowed per IP before 429 | `10` |
+| `SANDFISH_MAX_AGENTS` / `SANDFISH_MAX_ROUNDS` | Per-simulation caps in the API (`0` = unlimited) | `1000` / `10000` |
+| `SANDFISH_MAX_CONCURRENT_SIMULATIONS` | Simulations running at once in the API | `4` |
+| `SANDFISH_MAX_FINISHED_SIMULATIONS` | Finished simulations kept; oldest evicted | `100` |
 | `SANDFISH_CORS_ORIGINS` | Comma-separated CORS origins | unset |
 | `LLM_API_KEY` | Slot for user-provided LLM-backed agents | unset |
 
-Leaving `SANDFISH_API_KEY` unset disables auth — fine for local work, **not**
-fine for anything exposed to a network.
+Leaving `SANDFISH_API_KEY` unset disables auth — fine for local work, which
+is why `sandfish api` binds `127.0.0.1` by default and refuses a non-loopback
+`--host` without a key.
 
 ## Memory (OMPA 1.1)
 
@@ -173,16 +194,18 @@ sandfish orchestrator --agents 6 --rounds 5 --agent-types llm,default \
   with `SANDFISH_LLM_MODEL`.
 - The decision schema constrains `action` to the action enum and `target`
   to visible peers, so models can't invent agents.
-- Hard call budget (`--llm-max-calls`), retries on 429/5xx, and a
-  heuristic fallback on any error; keys are read from the environment and
-  redacted from errors.
+- Hard call budget per simulation (`--llm-max-calls`, or
+  `enable_llm_agents(client, max_calls=..., max_total_calls=...)` for an
+  overall cap too); per-simulation calls and tokens appear in the results'
+  metrics. Retries on 429/5xx, and a heuristic fallback on any error; keys
+  are read from the environment and redacted from errors.
 - `MockLLMClient` (`--llm-provider mock`) for tests and dry runs.
 
 ## Docker
 
 ```bash
 # build and run the API
-docker compose up --build
+SANDFISH_API_KEY=$(openssl rand -hex 32) docker compose up --build   # key required
 
 # run a long simulation alongside it
 docker compose --profile orchestrator up
