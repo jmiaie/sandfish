@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import random
 from typing import Any, Dict, List, Optional
 
 from ..agents.base_agent import (
@@ -77,7 +76,7 @@ class LLMAgent(DefaultAgent):
         rest = [p for p in self._peers if not engaged.get(p)]
         room = _MAX_VISIBLE_PEERS - len(hot)
         if room > 0 and rest:
-            hot += random.sample(rest, min(room, len(rest)))
+            hot += self.rng.sample(rest, min(room, len(rest)))
         return hot
 
     def _user_prompt(self, context: Any, peers: List[str], engaged: Dict[str, int]) -> str:

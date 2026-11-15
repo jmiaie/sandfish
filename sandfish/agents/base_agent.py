@@ -5,15 +5,14 @@ Provides agent types for swarm simulations with OMPA-native memory.
 """
 
 import random
-import secrets
 import uuid
 from abc import ABC, abstractmethod
 from collections import Counter, deque
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Callable, Deque, Dict, Iterator, List, Mapping as TMapping, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from ..memory.ompa_adapter import OMPAMemoryAdapter
 
@@ -99,25 +98,6 @@ _INTERACTION_PREDICATE = {
 }
 
 
-class _LazyContext(Mapping):
-    """Decision context whose memory lookups run only if a policy reads them."""
-
-    def __init__(self, eager: Dict[str, Any], lazy: Dict[str, Callable[[], Any]]):
-        self._values = dict(eager)
-        self._lazy = dict(lazy)
-
-    def __getitem__(self, key: str) -> Any:
-        if key not in self._values and key in self._lazy:
-            self._values[key] = self._lazy.pop(key)()
-        return self._values[key]
-
-    def __iter__(self) -> Iterator[str]:
-        return iter(list(self._values) + list(self._lazy))
-
-    def __len__(self) -> int:
-        return len(self._values) + len(self._lazy)
-
-
 # Energy costs by action type.
 _ENERGY_COSTS = {
     ActionType.CREATE_POST: 10.0,
@@ -129,6 +109,57 @@ _ENERGY_COSTS = {
     ActionType.DO_NOTHING: 0.5,
     ActionType.CUSTOM: 5.0,
 }
+
+
+class _LazyContext(Mapping):
+    """A read-only mapping that defers expensive lookups until a key is read.
+
+    Some context keys (`memories`, `related_entities`) cost a semantic search
+    and a graph traversal against the memory backend. Agents that decide from
+    their own state never read them, so computing every key up front spent one
+    search plus one traversal per agent per round on values that were then
+    discarded.
+
+    Deferred keys are resolved on first access and cached, so the cost is paid
+    only by agents that actually consult memory, and only once per round.
+    """
+
+    __slots__ = ("_values", "_deferred")
+
+    def __init__(
+        self,
+        values: Dict[str, Any],
+        deferred: Dict[str, Callable[[], Any]],
+    ):
+        self._values = dict(values)
+        self._deferred = dict(deferred)
+
+    def __getitem__(self, key: str) -> Any:
+        if key in self._values:
+            return self._values[key]
+        if key in self._deferred:
+            # pop first: a raising factory must not be retried on every access.
+            factory = self._deferred.pop(key)
+            value = factory()
+            self._values[key] = value
+            return value
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        yield from self._values
+        yield from self._deferred
+
+    def __len__(self) -> int:
+        return len(self._values) + len(self._deferred)
+
+    def copy(self) -> Dict[str, Any]:
+        """Resolve every key and return a plain dict.
+
+        Provided because callers commonly treat context as a dict; this forces
+        the deferred lookups, so prefer plain key access when you only need a
+        subset.
+        """
+        return {key: self[key] for key in list(self)}
 
 
 class BaseAgent(ABC):
@@ -154,10 +185,18 @@ class BaseAgent(ABC):
         profile: AgentProfile,
         memory_adapter: Optional[OMPAMemoryAdapter] = None,
         history_limit: int = DEFAULT_HISTORY_LIMIT,
+        rng: Optional[random.Random] = None,
     ):
         self.id = agent_id
         self.profile = profile
         self.memory = memory_adapter
+
+        # Per-agent RNG. Agents must never touch the `random` module globals:
+        # a shared global stream makes a run's outcome depend on how agent
+        # calls interleave, so the same seed would not reproduce the same run.
+        # Defaults to an independently seeded instance, preserving the
+        # unseeded behaviour of earlier versions.
+        self.rng = rng if rng is not None else random.Random()
 
         self.state = AgentStateData()
         self.status = AgentState.INITIALIZING
@@ -281,22 +320,23 @@ class BaseAgent(ABC):
             },
             "round": self.round_number,
             "action_count": len(self.action_history),
+            "memory_targeted_actions": self.memory_targeted_actions,
         }
 
     # ----- Internal helpers -----
 
-    def _gather_context(self) -> Mapping:
+    def _gather_context(self) -> Mapping[str, Any]:
         """Decision context. Memory lookups are lazy: they only run (and
         cost anything) if a policy actually reads ``memories``,
         ``related_entities`` or ``engaged_peers``."""
         return _LazyContext(
-            eager={
+            {
                 "current_state": self.state,
                 "round": self.round_number,
                 "date": self.current_date,
                 "peers": list(self._peers),
             },
-            lazy={
+            {
                 "memories": self._recall_memories,
                 "related_entities": self._recall_related,
                 "engaged_peers": lambda: dict(self._engaged_peers()),
@@ -346,14 +386,14 @@ class BaseAgent(ABC):
         engaged with us before (weighted by how often), else uniform."""
         if not self._peers:
             return None
-        if self.memory is not None and self.reciprocity > 0 and random.random() < self.reciprocity:
+        if self.memory is not None and self.reciprocity > 0 and self.rng.random() < self.reciprocity:
             engaged = self._engaged_peers()
             candidates = [p for p in self._peers if engaged.get(p)]
             if candidates:
                 self.memory_targeted_actions += 1
                 weights = [engaged[p] for p in candidates]
-                return random.choices(candidates, weights=weights)[0]
-        return random.choice(self._peers)
+                return self.rng.choices(candidates, weights=weights)[0]
+        return self.rng.choice(self._peers)
 
     def _enrich_action(self, action: Action) -> Action:
         """Fill in target/content for actions that need them."""
@@ -362,7 +402,10 @@ class BaseAgent(ABC):
 
         if action.action_type == ActionType.CREATE_POST and not action.content:
             content = self._generate_post_content()
-            post_id = f"post_{secrets.token_hex(4)}"
+            # Drawn from the agent RNG rather than `secrets` so a seeded run
+            # reproduces identical post IDs. These are simulation labels, not
+            # security tokens, so unpredictability is not a requirement.
+            post_id = f"post_{self.rng.getrandbits(32):08x}"
             action.content = content
             action.metadata.setdefault("post_id", post_id)
             self.state.posts_created.append(post_id)
@@ -374,7 +417,7 @@ class BaseAgent(ABC):
 
         Subclasses with LLM access can override this with real generation.
         """
-        topic = random.choice(self.profile.goals) if self.profile.goals else "the swarm"
+        topic = self.rng.choice(self.profile.goals) if self.profile.goals else "the swarm"
         return f"{self.profile.name}: thoughts on {topic}"
 
     def _action_handler(self, action_type: ActionType):
@@ -392,8 +435,12 @@ class BaseAgent(ABC):
         return handlers.get(action_type, self._action_custom)
 
     @abstractmethod
-    def _select_action(self, context: TMapping[str, Any]) -> Action:
-        """Select an action type given the gathered context."""
+    def _select_action(self, context: Mapping[str, Any]) -> Action:
+        """Select an action type given the gathered context.
+
+        Draw any randomness from `self.rng`, never the `random` module, or
+        seeded runs will not reproduce.
+        """
 
     def _log_event(self, event_type: str, metadata: Dict[str, Any]) -> None:
         if self.memory is None:
@@ -455,7 +502,7 @@ class BaseAgent(ABC):
 class DefaultAgent(BaseAgent):
     """Balanced agent with broad action distribution."""
 
-    def _select_action(self, context: TMapping[str, Any]) -> Action:
+    def _select_action(self, context: Mapping[str, Any]) -> Action:
         actions = [
             ActionType.CREATE_POST,
             ActionType.LIKE_POST,
@@ -465,7 +512,7 @@ class DefaultAgent(BaseAgent):
             ActionType.DO_NOTHING,
         ]
         weights = [0.2, 0.3, 0.2, 0.15, 0.1, 0.05]
-        return Action(action_type=random.choices(actions, weights=weights)[0])
+        return Action(action_type=self.rng.choices(actions, weights=weights)[0])
 
 
 class InfluencerAgent(BaseAgent):
@@ -474,7 +521,7 @@ class InfluencerAgent(BaseAgent):
     LOW_ENERGY_THRESHOLD = 15.0
     RECIPROCITY = 0.3  # broadcasters engage widely
 
-    def _select_action(self, context: TMapping[str, Any]) -> Action:
+    def _select_action(self, context: Mapping[str, Any]) -> Action:
         actions = [
             ActionType.CREATE_POST,
             ActionType.FOLLOW,
@@ -483,7 +530,7 @@ class InfluencerAgent(BaseAgent):
             ActionType.DO_NOTHING,
         ]
         weights = [0.4, 0.25, 0.2, 0.1, 0.05]
-        return Action(action_type=random.choices(actions, weights=weights)[0])
+        return Action(action_type=self.rng.choices(actions, weights=weights)[0])
 
 
 class LurkerAgent(BaseAgent):
@@ -492,7 +539,7 @@ class LurkerAgent(BaseAgent):
     LOW_ENERGY_THRESHOLD = 10.0
     RECIPROCITY = 0.8  # lurkers mostly respond to people who engaged them
 
-    def _select_action(self, context: TMapping[str, Any]) -> Action:
+    def _select_action(self, context: Mapping[str, Any]) -> Action:
         actions = [
             ActionType.DO_NOTHING,
             ActionType.SEARCH,
@@ -501,7 +548,7 @@ class LurkerAgent(BaseAgent):
             ActionType.CREATE_POST,
         ]
         weights = [0.5, 0.25, 0.15, 0.07, 0.03]
-        return Action(action_type=random.choices(actions, weights=weights)[0])
+        return Action(action_type=self.rng.choices(actions, weights=weights)[0])
 
 
 def _default_agent_name(agent_id: str) -> str:
@@ -527,9 +574,14 @@ def create_agent(
     agent_type: str,
     agent_id: Optional[str] = None,
     memory_adapter: Optional[OMPAMemoryAdapter] = None,
+    rng: Optional[random.Random] = None,
     **kwargs: Any,
 ) -> BaseAgent:
-    """Factory: construct an agent of the requested type."""
+    """Factory: construct an agent of the requested type.
+
+    Pass `rng` (a `random.Random`) to make the agent's choices reproducible.
+    Omit it and the agent seeds itself from the OS, as before.
+    """
     if agent_type not in AGENT_TYPES:
         raise ValueError(
             f"Unknown agent type: {agent_type}. Known: {sorted(AGENT_TYPES)}"
@@ -547,7 +599,11 @@ def create_agent(
     )
 
     agent_class = AGENT_TYPES[agent_type]
-    return agent_class(agent_id, profile, memory_adapter)
+    if rng is None:
+        # Omit the kwarg entirely so custom agent classes registered before
+        # `rng` existed — which may override __init__ without it — keep working.
+        return agent_class(agent_id, profile, memory_adapter)
+    return agent_class(agent_id, profile, memory_adapter, rng=rng)
 
 
 def register_agent_type(name: str, agent_class: type) -> None:

@@ -146,7 +146,8 @@ async def test_simulation_end_to_end_with_real_ompa(memory):
     assert result.status.value == "completed"
 
     agent_ids = orch.simulations[sim_id]["agents"]
-    names = {orch.agents[a].profile.name for a in agent_ids}
+    final = result.final_state  # agents are released after a terminal run
+    names = {final[a]["profile"]["name"] for a in agent_ids}
     assert len(names) == len(agent_ids)  # unique default names
 
     entity = memory.get_entity(agent_ids[0])
@@ -154,7 +155,7 @@ async def test_simulation_end_to_end_with_real_ompa(memory):
 
     total_incoming = sum(len(memory.get_interactions(a)) for a in agent_ids)
     assert total_incoming > 0
-    assert sum(orch.agents[a].memory_targeted_actions for a in agent_ids) > 0
+    assert sum(final[a]["memory_targeted_actions"] for a in agent_ids) > 0
 
     hits = memory.search(f"{agent_ids[1]} follow", limit=5)
     assert hits and any(agent_ids[1].split("_")[0] in h.content for h in hits)
