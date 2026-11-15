@@ -201,6 +201,62 @@ sandfish orchestrator --agents 6 --rounds 5 --agent-types llm,default \
   are read from the environment and redacted from errors.
 - `MockLLMClient` (`--llm-provider mock`) for tests and dry runs.
 
+## MCP server (optional)
+
+`sandfish-mcp` lets an MCP client such as Claude Code or Cursor create, run and
+inspect simulations. It uses stdio and the official Python MCP SDK, and its
+tool names take an `sf_` prefix, the same convention as OMPA's `ao_` tools.
+
+```bash
+pip install -e '.[mcp]'            # from a checkout
+# or: pip install 'sandfish[mcp] @ git+https://github.com/jmiaie/sandfish'
+sandfish-mcp --vault ./sandfish_vault
+```
+
+| Tool | What it does |
+| --- | --- |
+| `sf_create_simulation` | Create a simulation: name, agents, rounds, `agent_types`, `seed`, `start_date`, … |
+| `sf_start` | Start it in the background; `wait_seconds` (≤300) waits for it to finish |
+| `sf_pause` / `sf_resume` / `sf_stop` | Lifecycle control (`pausing` → `paused`; resume never re-runs a round) |
+| `sf_status` / `sf_list` | Status of one simulation / of all of them |
+| `sf_results` / `sf_report` | Metrics and top agents as JSON / as a Markdown report |
+| `sf_memory_search` | Search the OMPA memory; `reference_date` anchors "yesterday" in simulated time |
+| `sf_memory_entity` | One entity's facts and interactions, optionally `as_of` a date |
+
+Resources:
+
+- `sandfish://events` returns the recent event log, oldest first.
+- `sandfish://events/{simulation_id}` returns one simulation's events.
+
+The same `SANDFISH_MAX_*` caps as the HTTP API apply. Like other stdio MCP
+servers it has no authentication: it runs as you and talks only to the client
+that launched it.
+
+**Claude Code**
+
+```bash
+claude mcp add sandfish -e SANDFISH_OMPA_SEMANTIC=0 -- sandfish-mcp --vault /abs/path/to/sandfish_vault
+```
+
+**Cursor** (`~/.cursor/mcp.json`, or `.cursor/mcp.json` in a project):
+
+```json
+{
+  "mcpServers": {
+    "sandfish": {
+      "command": "sandfish-mcp",
+      "args": ["--vault", "/abs/path/to/sandfish_vault"],
+      "env": { "SANDFISH_OMPA_SEMANTIC": "0" }
+    }
+  }
+}
+```
+
+Use an absolute vault path, because clients start servers from their own
+working directory. If `sandfish-mcp` isn't on the client's `PATH`, use
+`"command": "/path/to/venv/bin/python", "args": ["-m", "sandfish.mcp_server", ...]`
+instead.
+
 ## Docker
 
 ```bash
@@ -224,6 +280,7 @@ sandfish/
   memory/       OMPAMemoryAdapter wrapper around the OMPA vault.
   security/     Static security auditor.
   cli.py        `sandfish` entry point.
+  mcp_server.py `sandfish-mcp` MCP server (stdio; `[mcp]` extra).
 tests/          pytest suite (unit + edge cases + integration).
 benchmarks/     Stand-alone benchmark runner.
 docs/           Design and install notes.
@@ -232,7 +289,7 @@ docs/           Design and install notes.
 ## Tests
 
 ```bash
-pip install -e '.[dev,llm]'
+pip install -e '.[dev,llm,mcp]'
 ruff check .
 pytest            # offline; set SANDFISH_OMPA_SEMANTIC=0 to skip embeddings
 pip-audit         # dependency advisories
