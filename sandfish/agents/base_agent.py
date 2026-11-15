@@ -16,7 +16,6 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from ..memory.ompa_adapter import OMPAMemoryAdapter
 
-
 # Soft cap on retained action history; older entries are dropped.
 DEFAULT_HISTORY_LIMIT = 1000
 

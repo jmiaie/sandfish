@@ -39,10 +39,11 @@ semantic = ["ompa[semantic]>=1.1.1,<2"]
 llm = ["httpx>=0.24.0"]
 dev = [
     "pytest>=7.0.0",
-    "pytest-asyncio>=0.21.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=4.0.0",
     "httpx>=0.24.0",
     "bandit>=1.7.0",
-    "safety>=2.3.0",
+    "pip-audit>=2.7.0",
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
@@ -65,6 +66,9 @@ target-version = ['py310']
 
 [tool.ruff]
 line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
 select = ["E", "F", "I", "W"]
 ignore = ["E501"]
 
@@ -77,6 +81,4 @@ disallow_untyped_defs = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-markers = [
-    "asyncio: marks tests as async",
-]
+asyncio_default_fixture_loop_scope = "function"

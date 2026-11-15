@@ -13,12 +13,12 @@ from sandfish.agents.base_agent import (
     ActionType,
     AgentProfile,
     AgentState,
+    BaseAgent,
     DefaultAgent,
     InfluencerAgent,
     LurkerAgent,
     create_agent,
     register_agent_type,
-    BaseAgent,
 )
 from sandfish.memory.ompa_adapter import OMPAMemoryAdapter
 

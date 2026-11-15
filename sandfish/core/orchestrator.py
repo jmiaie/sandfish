@@ -11,9 +11,8 @@ import json
 import logging
 import random
 import uuid
-import weakref
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
@@ -163,10 +162,10 @@ class SwarmOrchestrator:
         self._io_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="sandfish-io"
         )
-        # Also runs if the orchestrator is garbage-collected without close().
-        self._io_finalizer = weakref.finalize(
-            self, _shutdown_io, self._io_executor, memory_adapter
-        )
+        # No weakref finalizer here on purpose: one can fire from GC inside
+        # another executor's submit() (which holds concurrent.futures' global
+        # lock) and deadlock. An abandoned executor's idle worker exits by
+        # itself once the executor is collected; close() is the explicit path.
         self.logger = logging.getLogger("sandfish.orchestrator")
 
         # Active simulations keyed by sim_id.
@@ -264,7 +263,7 @@ class SwarmOrchestrator:
         """Shut down: release the storage I/O thread and the OMPA SQLite
         connections held by it and by the calling thread. The orchestrator
         should not be used afterwards."""
-        self._io_finalizer()
+        _shutdown_io(self._io_executor, self.memory)
         _close_memory_connections(self.memory, include_shared=True)
 
     def active_count(self, exclude: Optional[str] = None) -> int:

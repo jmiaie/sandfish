@@ -232,9 +232,14 @@ docs/           Design and install notes.
 ## Tests
 
 ```bash
-pip install -e '.[dev]'
-pytest
+pip install -e '.[dev,llm]'
+ruff check .
+pytest            # offline; set SANDFISH_OMPA_SEMANTIC=0 to skip embeddings
+pip-audit         # dependency advisories
 ```
+
+CI (`.github/workflows/ci.yml`) runs the same ruff + pytest on Python 3.12
+for pushes to `main` and for pull requests, with no secrets.
 
 The suite covers agent behavior, orchestrator lifecycle, and a handful of
 integration and stress tests. Async tests run under `pytest-asyncio`.
