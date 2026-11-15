@@ -36,7 +36,7 @@ For AegisFlow (stricter sandbox, lead/sub-agent delegation), see
 - Python 3.10 or newer
 - `fastapi`, `uvicorn[standard]`, `pydantic`, `python-dotenv`, `ompa` (pulled
   in by `pip install .`)
-- `pytest`, `pytest-asyncio`, `httpx`, `bandit`, `safety` for the `dev` extra
+- `pytest`, `pytest-asyncio`, `pytest-cov`, `httpx`, `bandit`, `pip-audit`, `ruff` for the `dev` extra
 - `PyYAML` only if you pass a YAML config file to the CLI
 
 ## Install
@@ -118,8 +118,8 @@ Available endpoints include:
   With an API key set, authenticate with an `X-API-Key` header or by sending
   `{"command": "auth", "api_key": "..."}` as the first message
   (`?api_key=` in the URL still works but is deprecated: URLs end up in logs).
-  Browser connections must come from a loopback origin when auth is off, or
-  from `SANDFISH_CORS_ORIGINS` when that is set.
+  Browser connections follow the same origin policy as REST
+  (`SANDFISH_CORS_ORIGINS`, default loopback origins only).
 
 Failed authentication is throttled per client IP (default 10 per minute, then
 429 for that IP, including requests with the right key). Behind a reverse
@@ -134,6 +134,11 @@ sandfish security-audit --path . --output audit.md
 
 Exits non-zero when any `CRITICAL` or `HIGH` finding is reported.
 
+The dependency check runs [`pip-audit`](https://pypi.org/project/pip-audit/)
+(in the `dev` extra) against the installed environment, which queries the
+PyPA advisory service over the network. It is skipped when pip-audit is not
+installed or when `SANDFISH_AUDIT_DEPENDENCIES=0`.
+
 ## Configuration
 
 Environment variables (see `.env.example` for the full list):
@@ -147,7 +152,7 @@ Environment variables (see `.env.example` for the full list):
 | `SANDFISH_MAX_AGENTS` / `SANDFISH_MAX_ROUNDS` | Per-simulation caps in the API (`0` = unlimited) | `1000` / `10000` |
 | `SANDFISH_MAX_CONCURRENT_SIMULATIONS` | Simulations running at once in the API | `4` |
 | `SANDFISH_MAX_FINISHED_SIMULATIONS` | Finished simulations kept; oldest evicted | `100` |
-| `SANDFISH_CORS_ORIGINS` | Comma-separated CORS origins | unset |
+| `SANDFISH_CORS_ORIGINS` | Browser origins allowed for REST and `/ws`. Accepts `localhost`, `none`, explicit `https://…` origins, or `*`. `*` needs `SANDFISH_API_KEY`, or startup fails | unset = `localhost` (loopback origins only) |
 | `LLM_API_KEY` | Slot for user-provided LLM-backed agents | unset |
 
 Leaving `SANDFISH_API_KEY` unset disables auth — fine for local work, which

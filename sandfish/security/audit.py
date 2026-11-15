@@ -4,7 +4,7 @@ Security audit and hardening module for SandFish.
 Provides:
 - Code pattern analysis (eval/exec, shell=True, weak crypto, etc.)
 - Configuration analysis (hardcoded secrets, weak defaults)
-- Dependency vulnerability scan (best-effort, via `safety` if installed)
+- Dependency vulnerability scan (best-effort, via `pip-audit` if installed)
 - File permission checks (POSIX only)
 - File integrity hashes
 """
@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -143,61 +144,81 @@ class SecurityAuditor:
 
     # ----- Dependency check -----
 
+    def _pip_audit_command(self) -> Optional[List[str]]:
+        """``python -m pip_audit`` for this interpreter, else ``pip-audit`` on PATH."""
+        try:
+            import importlib.util
+
+            if importlib.util.find_spec("pip_audit") is not None:
+                return [sys.executable, "-m", "pip_audit"]
+        except (ImportError, ValueError):
+            pass
+        exe = shutil.which("pip-audit")
+        return [exe] if exe else None
+
     def _audit_dependencies(self) -> None:
-        if not shutil.which("safety"):
-            self.logger.info("`safety` CLI not on PATH; skipping dependency audit.")
+        """Audit the installed environment with pip-audit (PyPA advisory DB).
+
+        Best-effort: skipped with a log line when pip-audit is not installed,
+        or when SANDFISH_AUDIT_DEPENDENCIES=0 (it queries the advisory
+        service over the network). Each vulnerable package becomes one HIGH
+        finding naming the advisories and fixed versions.
+        """
+        if os.environ.get("SANDFISH_AUDIT_DEPENDENCIES", "1").strip().lower() in ("0", "false", "no"):
+            self.logger.info("Dependency audit disabled (SANDFISH_AUDIT_DEPENDENCIES=0).")
+            return
+        base = self._pip_audit_command()
+        if base is None:
+            self.logger.info("`pip-audit` not installed; skipping dependency audit.")
+            return
+        cmd = [*base, "--format", "json", "--progress-spinner", "off"]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=180,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.logger.warning("`pip-audit` invocation failed: %s", exc)
             return
 
-        # `safety scan` is the modern subcommand; fall back to `check` for older versions.
-        for cmd in (["safety", "scan", "--output", "json"], ["safety", "check", "--json"]):
-            try:
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=120,
-                    cwd=str(self.project_root),
-                    check=False,
-                )
-            except FileNotFoundError:
-                self.logger.info("`safety` not installed; skipping dependency audit.")
-                return
-            except subprocess.SubprocessError as exc:
-                self.logger.warning("`safety` invocation failed: %s", exc)
-                continue
+        # pip-audit exits 0 when clean and 1 when vulnerabilities are found;
+        # anything else (or unparsable output) is a tool failure.
+        try:
+            data = json.loads(result.stdout) if result.stdout.strip() else None
+        except json.JSONDecodeError:
+            data = None
+        if data is None or result.returncode not in (0, 1):
+            detail = (result.stderr or "").strip().splitlines()[-1:] or ["no output"]
+            self.logger.warning(
+                "`pip-audit` failed (exit %s): %s", result.returncode, detail[0][:300]
+            )
+            return
 
-            if result.returncode == 0 and not result.stdout.strip():
-                # Modern safety prints empty output for clean repos.
-                return
-            if result.returncode == 0:
-                # Try to parse JSON; even success can include advisories.
-                try:
-                    data = json.loads(result.stdout)
-                except json.JSONDecodeError:
-                    return
-                vulns = data.get("vulnerabilities") or data.get("advisories") or []
-                if not vulns:
-                    return
-                for vuln in vulns:
-                    self.findings.append(
-                        SecurityFinding(
-                            severity="HIGH",
-                            category="dependency",
-                            description=str(vuln.get("advisory") or vuln),
-                            remediation="Upgrade the affected package.",
-                        )
-                    )
-                return
-            # Non-zero exit → vulnerabilities probably found.
+        deps = data.get("dependencies", []) if isinstance(data, dict) else data
+        for dep in deps or []:
+            vulns = dep.get("vulns") or []
+            if not vulns:
+                continue
+            ids = ", ".join(str(v.get("id")) for v in vulns)
+            fixes = sorted({fv for v in vulns for fv in (v.get("fix_versions") or [])})
             self.findings.append(
                 SecurityFinding(
                     severity="HIGH",
                     category="dependency",
-                    description="`safety` reported vulnerable dependencies.",
-                    remediation="Run `safety scan` for details and upgrade affected packages.",
+                    description=(
+                        f"{dep.get('name')} {dep.get('version')} has known "
+                        f"vulnerabilities: {ids}"
+                    ),
+                    remediation=(
+                        f"Upgrade {dep.get('name')} to {' or '.join(fixes)}."
+                        if fixes
+                        else f"No fixed release listed; review {ids} and consider replacing {dep.get('name')}."
+                    ),
                 )
             )
-            return
 
     # ----- Code scan -----
 

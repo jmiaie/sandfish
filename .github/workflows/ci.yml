@@ -19,6 +19,7 @@ jobs:
     env:
       # Offline: no secrets, no model downloads, no LLM calls.
       SANDFISH_OMPA_SEMANTIC: "0"
+      SANDFISH_AUDIT_DEPENDENCIES: "0"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
     steps:
       - uses: actions/checkout@v4
