@@ -44,9 +44,10 @@ import secrets
 import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from fastapi import (
     Depends,
@@ -193,7 +194,9 @@ def is_loopback_host(host: str) -> bool:
 
 
 def check_bind_allowed(host: str) -> None:
-    """Refuse to serve on a non-loopback address without an API key."""
+    """Refuse to serve on a non-loopback address without an API key, or
+    with an unsafe SANDFISH_CORS_ORIGINS (see cors_policy)."""
+    cors_policy()
     if not is_loopback_host(host) and _api_key_setting() is None:
         raise RuntimeError(
             f"Refusing to bind {host!r} without SANDFISH_API_KEY: the API would be "
@@ -337,6 +340,7 @@ def _resolve_vault_path(app: FastAPI) -> str:
 async def lifespan(app: FastAPI):
     global orchestrator
 
+    cors_policy()  # refuse to start with an unsafe/invalid CORS setting
     vault_path = _resolve_vault_path(app)
     memory = OMPAMemoryAdapter(vault_path)
     orchestrator = SwarmOrchestrator(memory, limits=SimulationLimits.from_env())
@@ -381,31 +385,110 @@ app = FastAPI(
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
+_LOOPBACK_ORIGIN_RE = r"^https?://(localhost|127(\.\d{1,3}){3}|\[::1\])(:\d{1,5})?$"
+_CORS_METHODS = ["GET", "POST"]
+_CORS_HEADERS = ["X-API-Key", "Content-Type"]
+
+
+@dataclass(frozen=True)
+class CorsPolicy:
+    """Which browser origins may call the API (and open /ws).
+
+    Configured with SANDFISH_CORS_ORIGINS, a comma-separated list:
+
+    - unset / empty / ``localhost``: loopback origins only
+      (http(s)://localhost, 127.x.x.x, [::1], any port). The default.
+    - ``none``: no cross-origin access at all.
+    - explicit origins, e.g. ``https://app.example.com``; may be combined
+      with ``localhost``.
+    - ``*``: any origin. Refused unless SANDFISH_API_KEY is set, since
+      without auth it would let any website drive the API.
+    """
+
+    origins: Tuple[str, ...] = ()
+    loopback: bool = True
+    any_origin: bool = False
+
+    def allows(self, origin: Optional[str]) -> bool:
+        if not origin:
+            return True  # not a browser cross-origin request
+        if self.any_origin or origin in self.origins:
+            return True
+        return self.loopback and _is_loopback_origin(origin)
+
+
+def cors_policy(env: Optional[Dict[str, str]] = None) -> CorsPolicy:
+    """Parse SANDFISH_CORS_ORIGINS; raises RuntimeError for `*` without auth."""
+    env = os.environ if env is None else env
+    raw = (env.get("SANDFISH_CORS_ORIGINS") or "").strip()
+    items = [item.strip() for item in raw.split(",") if item.strip()]
+    if not items:
+        return CorsPolicy()
+    lowered = [item.lower() for item in items]
+    if "none" in lowered:
+        if len(items) > 1:
+            raise RuntimeError("SANDFISH_CORS_ORIGINS: 'none' cannot be combined with other origins")
+        return CorsPolicy(loopback=False)
+    if "*" in items:
+        key = (env.get("SANDFISH_API_KEY") or "").strip()
+        if not key:
+            raise RuntimeError(
+                "SANDFISH_CORS_ORIGINS='*' is refused while auth is off: any website "
+                "could drive this API. Set SANDFISH_API_KEY or list explicit origins."
+            )
+        return CorsPolicy(any_origin=True, loopback=True)
+    origins = tuple(item.rstrip("/") for item, low in zip(items, lowered) if low != "localhost")
+    for origin in origins:
+        if not origin.startswith(("http://", "https://")):
+            raise RuntimeError(
+                f"SANDFISH_CORS_ORIGINS: {origin!r} is not an origin (expected http(s)://host[:port])"
+            )
+    return CorsPolicy(origins=origins, loopback="localhost" in lowered)
+
+
 def _allowed_origins() -> List[str]:
-    raw = os.environ.get("SANDFISH_CORS_ORIGINS", "")
-    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+    # Kept for backward compatibility with callers of the old helper.
+    return list(cors_policy().origins)
 
 
-_origins = _allowed_origins()
-if _origins:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=_origins,
-        allow_credentials=True,
-        allow_methods=["GET", "POST"],
-        allow_headers=["X-API-Key", "Content-Type"],
-    )
-else:
-    # Safe default: allow any origin but disable credentials so browsers
-    # don't accidentally expose cookies cross-origin. Tighten via
-    # SANDFISH_CORS_ORIGINS for production.
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=False,
-        allow_methods=["GET", "POST"],
-        allow_headers=["X-API-Key", "Content-Type"],
-    )
+class _DynamicCORS:
+    """CORSMiddleware built from the policy in effect at request time, so the
+    policy follows SANDFISH_CORS_ORIGINS/SANDFISH_API_KEY without re-importing
+    the app. An invalid policy fails closed (no cross-origin access)."""
+
+    def __init__(self, app: Any):
+        self.app = app
+        self._cache: Dict[CorsPolicy, CORSMiddleware] = {}
+
+    def _middleware(self) -> CORSMiddleware:
+        try:
+            policy = cors_policy()
+        except RuntimeError as exc:
+            logger.error("CORS disabled: %s", exc)
+            policy = CorsPolicy(loopback=False)
+        mw = self._cache.get(policy)
+        if mw is None:
+            if len(self._cache) > 8:
+                self._cache.clear()
+            mw = CORSMiddleware(
+                self.app,
+                allow_origins=["*"] if policy.any_origin else list(policy.origins),
+                allow_origin_regex=_LOOPBACK_ORIGIN_RE if policy.loopback and not policy.any_origin else None,
+                allow_credentials=False,  # auth is a header, never cookies
+                allow_methods=_CORS_METHODS,
+                allow_headers=_CORS_HEADERS,
+            )
+            self._cache[policy] = mw
+        return mw
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        await self._middleware()(scope, receive, send)
+
+
+app.add_middleware(_DynamicCORS)
 
 
 # ---------- Event broadcast ----------
@@ -743,19 +826,16 @@ def _is_loopback_origin(origin: str) -> bool:
     return is_loopback_host(host)
 
 
-def _ws_origin_allowed(origin: Optional[str], *, auth_on: bool) -> bool:
-    """Origin policy for /ws.
+def _ws_origin_allowed(origin: Optional[str], *, auth_on: bool = False) -> bool:
+    """Origin policy for /ws: the same CorsPolicy as the REST API.
 
-    No Origin header (non-browser client): allowed. SANDFISH_CORS_ORIGINS
-    set: the Origin must be listed. Otherwise: any origin when an API key is
-    required, loopback origins only when auth is off.
+    No Origin header (non-browser client) is allowed; an invalid policy
+    fails closed. ``auth_on`` is accepted for backward compatibility.
     """
-    if not origin:
-        return True
-    allowed = _allowed_origins()
-    if allowed:
-        return origin in allowed or "*" in allowed
-    return auth_on or _is_loopback_origin(origin)
+    try:
+        return cors_policy().allows(origin)
+    except RuntimeError:
+        return not origin
 
 
 # ---------- WebSocket ----------

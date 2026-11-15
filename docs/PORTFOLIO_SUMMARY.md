@@ -46,7 +46,7 @@ than production workloads.
 | Validation | pydantic v2 |
 | Storage | OMPA vault (SQLite-backed) |
 | Tests | pytest, pytest-asyncio |
-| Security | bandit, safety |
+| Security | bandit, pip-audit |
 | Packaging | hatchling |
 | Container | Docker, Docker Compose |
 

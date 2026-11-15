@@ -353,7 +353,7 @@ def test_readme_documents_ws_not_api_events():
     ("http://localhost:3000", None, "", True),
     ("http://127.0.0.1:8080", None, "", True),
     ("https://evil.example", None, "", False),
-    ("https://evil.example", KEY, "", True),        # key still required
+    ("https://evil.example", KEY, "", False),       # same CorsPolicy as REST
     ("https://app.example", None, "https://app.example", True),
     ("http://localhost:3000", None, "https://app.example", False),
 ])
