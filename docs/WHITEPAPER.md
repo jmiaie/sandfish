@@ -42,7 +42,7 @@ Non-goals:
 ```
 ┌──────────────────────────────────────────────┐
 │           API (FastAPI + uvicorn)            │
-│  REST endpoints · SSE event stream · auth    │
+│  REST endpoints · WS event stream · auth     │
 ├──────────────────────────────────────────────┤
 │              SwarmOrchestrator               │
 │  Round loop · pause/resume/stop · callbacks  │
@@ -103,7 +103,7 @@ service.
 
 - `/health` — unauthenticated liveness probe.
 - `/api/simulations/...` — CRUD and control endpoints for simulations.
-- `/api/events` — server-sent events stream for orchestrator events.
+- `WS /ws` — WebSocket stream of orchestrator events.
 
 If `SANDFISH_API_KEY` is set, every `/api/*` request must carry a matching
 `X-API-Key` header. A sliding-window rate limit (default 120

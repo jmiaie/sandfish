@@ -129,9 +129,13 @@ def cmd_orchestrator(args: argparse.Namespace) -> int:
         client = client_from_env(getattr(args, "llm_provider", None))
         llm_budget = enable_llm_agents(client, max_calls=args.llm_max_calls)
         label = f"{client.name}:{client.model}" if client is not None else "none (heuristic fallback)"
-        print(f"LLM agents: {label}, max {args.llm_max_calls} calls")
+        print(f"LLM agents: {label}, max {args.llm_max_calls} calls per simulation")
     orchestrator = create_orchestrator(args.vault, checkpoint_dir=args.checkpoint_dir)
-    sim_id = orchestrator.create_simulation(config)
+    try:
+        sim_id = orchestrator.create_simulation(config)
+    except (ValueError, RuntimeError) as exc:  # includes SimulationLimitError
+        print(f"Invalid simulation config: {exc}", file=sys.stderr)
+        return 2
     print(f"Created simulation: {sim_id}")
 
     if args.dry_run:
@@ -147,9 +151,10 @@ def cmd_orchestrator(args: argparse.Namespace) -> int:
     print(f"  Rounds:   {result.rounds_completed}")
     print(f"  Metrics:  {result.metrics}")
     if llm_budget is not None:
+        # Agents are released after the run; read the final-state snapshot.
         fallbacks = sum(
-            getattr(orchestrator.agents.get(a), "llm_fallbacks", 0)
-            for a in orchestrator.simulations[sim_id]["agents"]
+            (state.get("llm") or {}).get("fallbacks", 0)
+            for state in result.final_state.values()
         )
         print(
             f"  LLM:      {llm_budget.calls} calls, "
@@ -164,16 +169,20 @@ def cmd_orchestrator(args: argparse.Namespace) -> int:
 
 def cmd_api(args: argparse.Namespace) -> int:
     print_banner()
-    print(f"Starting API on http://{args.host}:{args.port} (vault: {args.vault})")
-
     try:
-        from .api.main import configure_app
+        from .api.main import check_bind_allowed, configure_app
         import uvicorn
     except ImportError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         print("Install API extras with: pip install 'fastapi uvicorn[standard]'", file=sys.stderr)
         return 1
 
+    try:
+        check_bind_allowed(args.host)
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    print(f"Starting API on http://{args.host}:{args.port} (vault: {args.vault})")
     app = configure_app(vault_path=args.vault, debug=args.debug)
     uvicorn.run(app, host=args.host, port=args.port)
     return 0
@@ -260,14 +269,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     orch.add_argument(
         "--llm-max-calls", type=int, default=200,
-        help="Hard cap on LLM calls for the whole run (default: 200)",
+        help="Hard cap on LLM calls per simulation (default: 200)",
     )
     orch.add_argument("--dry-run", action="store_true", help="Create the simulation but don't run it")
     orch.set_defaults(func=cmd_orchestrator)
 
     # api
     api = subparsers.add_parser("api", help="Run the HTTP API server")
-    api.add_argument("--host", default="0.0.0.0", help="Bind host")
+    api.add_argument(
+        "--host", default="127.0.0.1",
+        help="Bind host (default 127.0.0.1; non-loopback requires SANDFISH_API_KEY)",
+    )
     api.add_argument("--port", type=int, default=8000, help="Bind port")
     api.add_argument("--vault", default="./sandfish_vault", help="Path to OMPA vault")
     api.add_argument("--debug", action="store_true", help="Enable verbose error responses")

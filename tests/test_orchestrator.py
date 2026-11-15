@@ -102,7 +102,8 @@ class TestSimulationControl:
         # Force RUNNING and pause
         orchestrator.simulations[sim_id]["status"] = SimulationStatus.RUNNING
         assert orchestrator.pause_simulation(sim_id) is True
-        assert orchestrator.simulations[sim_id]["status"] == SimulationStatus.PAUSED
+        # PAUSING until the run loop finishes its round and exits.
+        assert orchestrator.simulations[sim_id]["status"] == SimulationStatus.PAUSING
 
     def test_resume_simulation_only_when_paused(self, orchestrator, sample_config):
         sim_id = orchestrator.create_simulation(sample_config)
@@ -172,9 +173,10 @@ class TestRunSimulation:
         )
         sim_id = orchestrator.create_simulation(config)
 
-        # Pre-mark as paused at round 2 so the loop should resume from round 2.
+        # Pre-mark as paused after 2 completed rounds: resume runs rounds 2 and 3.
         orchestrator.simulations[sim_id]["agents_initialized"] = True
-        orchestrator.simulations[sim_id]["current_round"] = 2
+        orchestrator.simulations[sim_id]["current_round"] = 1
+        orchestrator.simulations[sim_id]["rounds_completed"] = 2
         orchestrator.simulations[sim_id]["status"] = SimulationStatus.PAUSED
 
         # Pre-populate fake agents so _initialize_agents isn't called.

@@ -202,6 +202,9 @@ class BaseAgent(ABC):
         self.status = AgentState.INITIALIZING
 
         self.simulation_id: Optional[str] = None
+        # Shared by all agents of one simulation (set by the orchestrator);
+        # holds per-simulation resources such as the LLM call budget.
+        self.simulation_context: Dict[str, Any] = {}
         self.round_number: int = 0
         # Simulation calendar date (YYYY-MM-DD) set by the orchestrator each
         # round; used to date memory writes. None means "today".

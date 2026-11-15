@@ -5,11 +5,14 @@ Manages multi-agent simulations with OMPA-native memory.
 """
 
 import asyncio
+import functools
 import inspect
 import json
 import logging
 import random
 import uuid
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, asdict
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
@@ -23,6 +26,9 @@ class SimulationStatus(Enum):
     """Simulation execution states."""
     PENDING = "pending"
     RUNNING = "running"
+    # A pause was requested; the in-flight round is finishing. The run loop
+    # moves to PAUSED when it exits, so PAUSED always means "no loop running".
+    PAUSING = "pausing"
     PAUSED = "paused"
     COMPLETED = "completed"
     STOPPED = "stopped"
@@ -40,6 +46,43 @@ _FINISHED_STATUSES = {
     SimulationStatus.STOPPED,
     SimulationStatus.FAILED,
 }
+
+# Statuses that hold a run loop (count toward the concurrency cap).
+_ACTIVE_STATUSES = {SimulationStatus.RUNNING, SimulationStatus.PAUSING}
+
+
+class SimulationLimitError(RuntimeError):
+    """Raised when a request would exceed a configured SimulationLimits cap."""
+
+
+@dataclass
+class SimulationLimits:
+    """Resource caps. ``None`` means unlimited (the library default; the API
+    server sets finite defaults from the environment)."""
+    max_agents: Optional[int] = None
+    max_rounds: Optional[int] = None
+    max_concurrent: Optional[int] = None
+    # Finished (completed/stopped/failed) simulations kept for status and
+    # results queries; the oldest beyond this are evicted.
+    max_finished: Optional[int] = None
+
+    @classmethod
+    def from_env(cls, env: Optional[Dict[str, str]] = None) -> "SimulationLimits":
+        import os
+
+        env = os.environ if env is None else env
+
+        def _get(name: str, default: int) -> Optional[int]:
+            raw = str(env.get(name, default)).strip()
+            value = int(raw)
+            return None if value <= 0 else value
+
+        return cls(
+            max_agents=_get("SANDFISH_MAX_AGENTS", 1000),
+            max_rounds=_get("SANDFISH_MAX_ROUNDS", 10_000),
+            max_concurrent=_get("SANDFISH_MAX_CONCURRENT_SIMULATIONS", 4),
+            max_finished=_get("SANDFISH_MAX_FINISHED_SIMULATIONS", 100),
+        )
 
 
 @dataclass
@@ -110,8 +153,20 @@ class SwarmOrchestrator:
         self,
         memory_adapter: OMPAMemoryAdapter,
         checkpoint_dir: Optional[Path] = None,
+        limits: Optional[SimulationLimits] = None,
     ):
         self.memory = memory_adapter
+        self.limits = limits or SimulationLimits()
+        # One worker for blocking storage I/O (vault flushes, checkpoint
+        # files): keeps it off the event loop, serialises writes, and bounds
+        # the per-thread SQLite connections OMPA opens to one extra thread.
+        self._io_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="sandfish-io"
+        )
+        # Also runs if the orchestrator is garbage-collected without close().
+        self._io_finalizer = weakref.finalize(
+            self, _shutdown_io, self._io_executor, memory_adapter
+        )
         self.logger = logging.getLogger("sandfish.orchestrator")
 
         # Active simulations keyed by sim_id.
@@ -133,8 +188,38 @@ class SwarmOrchestrator:
 
     # ----- Simulation lifecycle -----
 
+    def validate_config(self, config: SimulationConfig) -> None:
+        """Raise ValueError (bad input) or SimulationLimitError (over a cap)."""
+        from ..agents.base_agent import AGENT_TYPES  # local import avoids cycle
+
+        if not config.agent_types:
+            raise ValueError("agent_types must name at least one agent type")
+        unknown = sorted({t for t in config.agent_types if t not in AGENT_TYPES})
+        if unknown:
+            raise ValueError(
+                f"Unknown agent type(s): {unknown}. Known: {sorted(AGENT_TYPES)}"
+            )
+        if config.num_agents < 0:
+            raise ValueError("num_agents must be >= 0")
+        if config.max_rounds < 0:
+            raise ValueError("max_rounds must be >= 0")
+        lim = self.limits
+        if lim.max_agents is not None and config.num_agents > lim.max_agents:
+            raise SimulationLimitError(
+                f"num_agents {config.num_agents} exceeds the limit of {lim.max_agents}"
+            )
+        if lim.max_rounds is not None and config.max_rounds > lim.max_rounds:
+            raise SimulationLimitError(
+                f"max_rounds {config.max_rounds} exceeds the limit of {lim.max_rounds}"
+            )
+
     def create_simulation(self, config: SimulationConfig) -> str:
-        """Create a new simulation and return its ID."""
+        """Create a new simulation and return its ID.
+
+        Raises ValueError for an invalid config (unknown or empty agent
+        types, bad dates) and SimulationLimitError when over a cap.
+        """
+        self.validate_config(config)
         if config.start_date:
             # Validate early (ValueError) including the last round's date.
             try:
@@ -148,7 +233,12 @@ class SwarmOrchestrator:
             "config": config,
             "status": SimulationStatus.PENDING,
             "current_round": 0,
+            # Rounds fully executed; a resumed run starts at this index.
+            "rounds_completed": 0,
             "agents": [],
+            # Per-simulation scratch shared by this run's agents (e.g. the
+            # LLM call budget); dropped with the simulation.
+            "context": {},
             "agents_initialized": False,
             "start_time": None,
             "end_time": None,
@@ -170,6 +260,54 @@ class SwarmOrchestrator:
         self.logger.info("Created simulation %s: %s", sim_id, config.name)
         return sim_id
 
+    def close(self) -> None:
+        """Shut down: release the storage I/O thread and the OMPA SQLite
+        connections held by it and by the calling thread. The orchestrator
+        should not be used afterwards."""
+        self._io_finalizer()
+        _close_memory_connections(self.memory, include_shared=True)
+
+    def active_count(self, exclude: Optional[str] = None) -> int:
+        """Number of simulations currently holding a run loop."""
+        # A stop is only a request: a STOPPED simulation whose loop is still
+        # finishing its round holds the lock and still counts.
+        return sum(
+            1
+            for sid, sim in self.simulations.items()
+            if sid != exclude
+            and (sim["status"] in _ACTIVE_STATUSES or self._loop_active(sid))
+        )
+
+    def _loop_active(self, sim_id: str) -> bool:
+        lock = self._sim_locks.get(sim_id)
+        return lock is not None and lock.locked()
+
+    def _check_concurrency(self, sim_id: str) -> None:
+        cap = self.limits.max_concurrent
+        if cap is not None and self.active_count(exclude=sim_id) >= cap:
+            raise SimulationLimitError(
+                f"{cap} simulation(s) already running; the limit is {cap}"
+            )
+
+    def reserve_start(self, sim_id: str) -> None:
+        """Synchronously claim a run slot for a PENDING simulation.
+
+        Marks it RUNNING before any task is scheduled, so two back-to-back
+        start/resume requests can't both pass the concurrency check, and a
+        status poll never sees a stale PENDING/PAUSED for a run that has
+        been accepted. Raises KeyError, RuntimeError (not startable) or
+        SimulationLimitError.
+        """
+        sim = self.simulations[sim_id]
+        if sim["status"] != SimulationStatus.PENDING:
+            raise RuntimeError(
+                f"Simulation {sim_id} is {sim['status'].value}, not pending"
+            )
+        if self._sim_locks.get(sim_id) is not None and self._sim_locks[sim_id].locked():
+            raise RuntimeError(f"Simulation {sim_id} is already running")
+        self._check_concurrency(sim_id)
+        sim["status"] = SimulationStatus.RUNNING
+
     async def run_simulation(self, sim_id: str) -> SimulationResult:
         """
         Execute a simulation. Safe to call again after a pause to resume
@@ -184,96 +322,122 @@ class SwarmOrchestrator:
                 f"Simulation {sim_id} is already running. Pause it first."
             )
 
-        async with lock:
-            sim = self.simulations[sim_id]
-            config: SimulationConfig = sim["config"]
-
-            # Decide where to resume from.
-            resume_from = sim["current_round"] if sim["agents_initialized"] else 0
-            sim["status"] = SimulationStatus.RUNNING
-            if sim["start_time"] is None:
-                sim["start_time"] = _utcnow()
-
-            self.logger.info(
-                "Starting simulation %s from round %d", sim_id, resume_from
-            )
-
-            try:
-                if not sim["agents_initialized"]:
-                    await self._initialize_agents(sim_id, config)
-                    sim["agents_initialized"] = True
-
-                for round_num in range(resume_from, config.max_rounds):
-                    sim["current_round"] = round_num
-                    await self._execute_round(sim_id, round_num)
-
-                    # Count completed rounds, not the zero-based index: the old
-                    # `round_num % interval` snapshotted round 0 (after a single
-                    # round) and then drifted off the interval boundary.
-                    if (
-                        config.checkpoint_interval
-                        and (round_num + 1) % config.checkpoint_interval == 0
-                    ):
-                        await self._create_checkpoint(sim_id, round_num + 1)
-
-                    await self._emit_event(
-                        "round_complete",
-                        {
-                            "simulation_id": sim_id,
-                            "round": round_num,
-                            "total_rounds": config.max_rounds,
-                        },
-                    )
-
-                    # Cooperative cancellation: yield, then check status.
-                    await asyncio.sleep(0)
-                    status = sim["status"]
-                    if status == SimulationStatus.PAUSED:
-                        self.logger.info(
-                            "Simulation %s paused at round %d", sim_id, round_num
-                        )
-                        return self._create_result(sim, partial=True)
-                    if status in _TERMINAL_RUN_STATUSES:
-                        self.logger.info(
-                            "Simulation %s stopped at round %d", sim_id, round_num
-                        )
-                        sim["end_time"] = _utcnow()
-                        await self._create_final_checkpoint(sim_id, partial=True)
-                        result = self._create_result(sim, partial=True)
-                        self._release_agents(sim_id)
-                        return result
-
-                # Loop completed naturally.
-                sim["status"] = SimulationStatus.COMPLETED
-                sim["current_round"] = config.max_rounds
+        sim = self.simulations[sim_id]
+        if not lock.locked():
+            # A pause/stop that arrived after reserve_start() but before this
+            # task got to run: honour it here, since no loop will.
+            if sim["status"] == SimulationStatus.PAUSING:
+                sim["status"] = SimulationStatus.PAUSED
+                return self._create_result(sim, partial=True)
+            if sim["status"] == SimulationStatus.STOPPED and sim["end_time"] is None:
                 sim["end_time"] = _utcnow()
-                await self._create_final_checkpoint(sim_id)
-
-            except Exception as exc:
-                sim["status"] = SimulationStatus.FAILED
-                sim["error"] = str(exc)
-                sim["end_time"] = _utcnow()
-                self.logger.exception("Simulation %s failed", sim_id)
-
-            result = self._create_result(sim)
-            self._release_agents(sim_id)
-
-            self.memory.record_event(
-                event_type="SIMULATION_COMPLETED",
-                description=(
-                    f"Simulation '{config.name}' ended with status "
-                    f"{result.status.value}"
-                ),
-                metadata={
-                    "simulation_id": sim_id,
-                    "rounds": result.rounds_completed,
-                    "metrics": result.metrics,
-                },
-                date=config.round_date(max(0, result.rounds_completed - 1)),
+                self._release_agents(sim_id)
+                self._prune_finished()
+                return self._create_result(sim, partial=True)
+        if sim["status"] in _FINISHED_STATUSES:
+            raise RuntimeError(
+                f"Simulation {sim_id} already {sim['status'].value}; create a new one"
             )
-            self._flush_memory()
+        self._check_concurrency(sim_id)
 
-            return result
+        try:
+            async with lock:
+                config: SimulationConfig = sim["config"]
+
+                # Resume after the last fully executed round, never re-run it.
+                resume_from = sim["rounds_completed"] if sim["agents_initialized"] else 0
+                sim["status"] = SimulationStatus.RUNNING
+                if sim["start_time"] is None:
+                    sim["start_time"] = _utcnow()
+
+                self.logger.info(
+                    "Starting simulation %s from round %d", sim_id, resume_from
+                )
+
+                try:
+                    if not sim["agents_initialized"]:
+                        await self._initialize_agents(sim_id, config)
+                        sim["agents_initialized"] = True
+
+                    for round_num in range(resume_from, config.max_rounds):
+                        sim["current_round"] = round_num
+                        await self._execute_round(sim_id, round_num)
+                        sim["rounds_completed"] = round_num + 1
+
+                        # Count completed rounds, not the zero-based index: the old
+                        # `round_num % interval` snapshotted round 0 (after a single
+                        # round) and then drifted off the interval boundary.
+                        if (
+                            config.checkpoint_interval
+                            and (round_num + 1) % config.checkpoint_interval == 0
+                        ):
+                            await self._create_checkpoint(sim_id, round_num + 1)
+
+                        await self._emit_event(
+                            "round_complete",
+                            {
+                                "simulation_id": sim_id,
+                                "round": round_num,
+                                "total_rounds": config.max_rounds,
+                            },
+                        )
+
+                        # Cooperative cancellation: yield, then check status.
+                        await asyncio.sleep(0)
+                        status = sim["status"]
+                        if status in (SimulationStatus.PAUSING, SimulationStatus.PAUSED):
+                            # No await between here and releasing the lock, so
+                            # PAUSED is only observable once the loop has exited.
+                            sim["status"] = SimulationStatus.PAUSED
+                            self.logger.info(
+                                "Simulation %s paused at round %d", sim_id, round_num
+                            )
+                            return self._create_result(sim, partial=True)
+                        if status in _TERMINAL_RUN_STATUSES:
+                            self.logger.info(
+                                "Simulation %s stopped at round %d", sim_id, round_num
+                            )
+                            sim["end_time"] = _utcnow()
+                            await self._create_final_checkpoint(sim_id, partial=True)
+                            result = self._create_result(sim, partial=True)
+                            self._release_agents(sim_id)
+                            await self._flush_memory_async()
+                            return result
+
+                    # Loop completed naturally.
+                    sim["status"] = SimulationStatus.COMPLETED
+                    sim["current_round"] = config.max_rounds
+                    sim["end_time"] = _utcnow()
+                    await self._create_final_checkpoint(sim_id)
+
+                except Exception as exc:
+                    sim["status"] = SimulationStatus.FAILED
+                    sim["error"] = str(exc)
+                    sim["end_time"] = _utcnow()
+                    self.logger.exception("Simulation %s failed", sim_id)
+
+                result = self._create_result(sim)
+                self._release_agents(sim_id)
+
+                self.memory.record_event(
+                    event_type="SIMULATION_COMPLETED",
+                    description=(
+                        f"Simulation '{config.name}' ended with status "
+                        f"{result.status.value}"
+                    ),
+                    metadata={
+                        "simulation_id": sim_id,
+                        "rounds": result.rounds_completed,
+                        "metrics": result.metrics,
+                    },
+                    date=config.round_date(max(0, result.rounds_completed - 1)),
+                )
+                await self._flush_memory_async()
+
+                return result
+        finally:
+            # After the lock is released, so this run counts as finished.
+            self._prune_finished()
 
     # ----- Internal execution helpers -----
 
@@ -302,6 +466,7 @@ class SwarmOrchestrator:
             sim["agents"].append(agent.id)
             self.agents[agent.id] = agent
             agent.simulation_id = sim_id
+            agent.simulation_context = sim["context"]
             agent.current_date = config.round_date(0)
             await agent.initialize(config.seed_data)
 
@@ -329,8 +494,16 @@ class SwarmOrchestrator:
 
         await self._update_shared_state(sim_id, list(zip(peer_ids, actions)))
         # One dated vault note per round keeps events searchable without a
-        # file per event.
-        self._flush_memory()
+        # file per event. Vault writes and index updates are blocking I/O, so
+        # they run in a worker thread (the adapter and OMPA are thread-safe).
+        await self._flush_memory_async()
+
+    async def _flush_memory_async(self) -> None:
+        await self._run_io(self._flush_memory)
+
+    async def _run_io(self, fn: Callable[..., Any], *args: Any) -> Any:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._io_executor, functools.partial(fn, *args))
 
     def _flush_memory(self) -> None:
         flush = getattr(self.memory, "flush", None)
@@ -412,8 +585,10 @@ class SwarmOrchestrator:
         if self.checkpoint_dir is not None:
             path = self.checkpoint_dir / f"{sim_id}_round_{checkpoint['round']:06d}.json"
             try:
-                path.write_text(json.dumps(checkpoint, default=str), encoding="utf-8")
-            except OSError as exc:
+                # Serialise + write off the event loop; the snapshot is a
+                # fresh dict that nothing else mutates.
+                await self._run_io(_write_checkpoint, path, checkpoint)
+            except (OSError, TypeError, ValueError, RuntimeError) as exc:
                 self.logger.warning("Failed to persist checkpoint %s: %s", path, exc)
 
         self.logger.debug(
@@ -423,24 +598,37 @@ class SwarmOrchestrator:
     # ----- Control plane -----
 
     def pause_simulation(self, sim_id: str) -> bool:
-        """Request a pause; takes effect at the end of the current round."""
+        """Request a pause; takes effect at the end of the current round.
+
+        The status is PAUSING until the run loop exits, then PAUSED.
+        """
         sim = self.simulations.get(sim_id)
         if sim is None:
             return False
         if sim["status"] == SimulationStatus.RUNNING:
-            sim["status"] = SimulationStatus.PAUSED
-            self.logger.info("Paused simulation %s", sim_id)
+            sim["status"] = SimulationStatus.PAUSING
+            self.logger.info("Pause requested for simulation %s", sim_id)
             return True
         return False
 
     def resume_simulation(self, sim_id: str) -> bool:
-        """Mark a paused simulation runnable again. Caller must invoke run_simulation."""
+        """Undo a pause.
+
+        PAUSED -> PENDING: the caller must invoke run_simulation again (it
+        continues from the next unexecuted round).
+        PAUSING -> RUNNING: the pause hadn't taken effect yet, so the still
+        active loop simply keeps going; the caller must NOT start a new run.
+        """
         sim = self.simulations.get(sim_id)
         if sim is None:
             return False
         if sim["status"] == SimulationStatus.PAUSED:
             sim["status"] = SimulationStatus.PENDING
             self.logger.info("Resumed simulation %s", sim_id)
+            return True
+        if sim["status"] == SimulationStatus.PAUSING:
+            sim["status"] = SimulationStatus.RUNNING
+            self.logger.info("Cancelled pending pause of simulation %s", sim_id)
             return True
         return False
 
@@ -449,7 +637,11 @@ class SwarmOrchestrator:
         sim = self.simulations.get(sim_id)
         if sim is None:
             return False
-        if sim["status"] in (SimulationStatus.RUNNING, SimulationStatus.PAUSED):
+        if sim["status"] in (
+            SimulationStatus.RUNNING,
+            SimulationStatus.PAUSING,
+            SimulationStatus.PAUSED,
+        ):
             was_paused = sim["status"] == SimulationStatus.PAUSED
             sim["status"] = SimulationStatus.STOPPED
             if was_paused:
@@ -457,9 +649,32 @@ class SwarmOrchestrator:
                 # has no loop to observe the stop, so free its agents here.
                 sim["end_time"] = _utcnow()
                 self._release_agents(sim_id)
+                self._prune_finished()
             self.logger.info("Stopped simulation %s", sim_id)
             return True
         return False
+
+    def _prune_finished(self) -> List[str]:
+        """Evict the oldest finished simulations beyond ``limits.max_finished``."""
+        cap = self.limits.max_finished
+        if cap is None:
+            return []
+        finished = [
+            (sim["end_time"] or sim["start_time"] or _utcnow(), sid)
+            for sid, sim in self.simulations.items()
+            if sim["status"] in _FINISHED_STATUSES and not self._loop_active(sid)
+        ]
+        excess = len(finished) - cap
+        if excess <= 0:
+            return []
+        finished.sort()
+        evicted = [sid for _, sid in finished[:excess]]
+        for sid in evicted:
+            self._release_agents(sid)
+            self.simulations.pop(sid, None)
+            self._sim_locks.pop(sid, None)
+        self.logger.info("Evicted %d finished simulation(s)", len(evicted))
+        return evicted
 
     def get_simulation_status(self, sim_id: str) -> Optional[Dict[str, Any]]:
         """Return current status for a simulation, or None if not found."""
@@ -472,6 +687,7 @@ class SwarmOrchestrator:
             "name": sim["config"].name,
             "status": sim["status"].value,
             "current_round": sim["current_round"],
+            "rounds_completed": self._rounds_completed(sim),
             "total_rounds": sim["config"].max_rounds,
             "num_agents": len(sim["agents"]),
             "start_time": sim["start_time"].isoformat() if sim["start_time"] else None,
@@ -511,19 +727,14 @@ class SwarmOrchestrator:
     # ----- Result construction -----
 
     def _rounds_completed(self, sim: Dict[str, Any], partial: bool = False) -> int:
-        """Number of rounds fully executed.
+        """Number of rounds fully executed (a failed round is not counted).
 
-        On natural completion the run loop already advances current_round to
-        max_rounds, so rounds_completed == current_round. On a partial exit
-        (pause/stop) the current_round is the index of the last fully executed
-        round, so rounds_completed == current_round + 1. On a failure the
-        current round threw before finishing, so it is not counted.
+        ``partial`` is kept for API compatibility; the counter is exact in
+        every exit path, so it no longer changes the answer.
         """
         if not sim["agents_initialized"]:
             return 0
-        if partial:
-            return sim["current_round"] + 1
-        return sim["current_round"]
+        return int(sim.get("rounds_completed", 0))
 
     def _create_result(self, sim: Dict[str, Any], partial: bool = False) -> SimulationResult:
         """Build a SimulationResult for the current state of `sim`."""
@@ -560,11 +771,42 @@ class SwarmOrchestrator:
         """Compute coarse simulation metrics."""
         config: SimulationConfig = sim["config"]
         max_rounds = max(1, config.max_rounds)
-        return {
-            "completion_rate": min(1.0, sim["current_round"] / max_rounds),
+        metrics = {
+            "completion_rate": min(1.0, self._rounds_completed(sim) / max_rounds),
             "agent_count": float(len(sim["agents"])),
             "checkpoint_count": float(len(sim["checkpoints"])),
         }
+        budget = sim.get("context", {}).get("llm_budget")
+        if budget is not None:
+            metrics["llm_calls"] = float(budget.calls)
+            metrics["llm_input_tokens"] = float(budget.input_tokens)
+            metrics["llm_output_tokens"] = float(budget.output_tokens)
+        return metrics
+
+
+def _close_memory_connections(memory: Any, include_shared: bool = False) -> None:
+    """Close the calling thread's OMPA SQLite connections (best-effort)."""
+    backend = getattr(memory, "backend", None)
+    names = ("kg", "personal_kg", "keyword") if include_shared else ("kg", "personal_kg")
+    for name in names:
+        close = getattr(getattr(backend, name, None), "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+
+def _shutdown_io(executor: ThreadPoolExecutor, memory: Any) -> None:
+    try:
+        executor.submit(_close_memory_connections, memory).result(timeout=5)
+    except Exception:
+        pass
+    executor.shutdown(wait=False)
+
+
+def _write_checkpoint(path: Path, checkpoint: Dict[str, Any]) -> None:
+    path.write_text(json.dumps(checkpoint, default=str), encoding="utf-8")
 
 
 def create_orchestrator(
