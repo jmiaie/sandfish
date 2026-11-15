@@ -397,3 +397,34 @@ async def test_client_side_budget_refusal_refunds_simulation_budget():
         assert agent.simulation_budget().calls == 0
     finally:
         disable_llm_agents()
+
+
+def test_many_short_lived_orchestrators_do_not_deadlock(tmp_path):
+    """Regression: a GC-run finalizer that submitted to an executor could
+    deadlock inside another executor's submit(). Run in a subprocess with
+    aggressive GC so a hang fails fast instead of stalling the suite."""
+    import subprocess
+    import sys
+    import textwrap
+
+    code = textwrap.dedent(f"""
+        import asyncio, gc
+        gc.set_threshold(1, 1, 1)
+        from sandfish.core.orchestrator import SwarmOrchestrator, SimulationConfig
+        from sandfish.memory.ompa_adapter import OMPAMemoryAdapter
+
+        async def main():
+            for i in range(60):
+                orch = SwarmOrchestrator(OMPAMemoryAdapter({str(tmp_path)!r} + f"/v{{i}}", enable_semantic=False))
+                sid = orch.create_simulation(SimulationConfig(name="x", max_rounds=2, num_agents=2))
+                await orch.run_simulation(sid)
+                if i % 3 == 0:
+                    orch.close()
+                orch._cycle = orch  # cyclic garbage: freed by the GC mid-submit()
+                del orch
+        asyncio.run(main())
+        print("ok")
+    """)
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=90)
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert out.stdout.strip().endswith("ok")

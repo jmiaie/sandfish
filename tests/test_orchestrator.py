@@ -4,9 +4,6 @@ Tests for SwarmOrchestrator.
 
 from __future__ import annotations
 
-import asyncio
-import tempfile
-from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
@@ -180,8 +177,8 @@ class TestRunSimulation:
         orchestrator.simulations[sim_id]["status"] = SimulationStatus.PAUSED
 
         # Pre-populate fake agents so _initialize_agents isn't called.
+
         from sandfish.agents.base_agent import create_agent
-        from unittest.mock import Mock as _Mock
 
         for i in range(2):
             agent = create_agent("default", agent_id=f"{sim_id}_agent_{i}")

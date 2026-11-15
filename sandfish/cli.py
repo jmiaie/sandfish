@@ -22,7 +22,6 @@ from . import __version__
 from .core.orchestrator import SimulationConfig, create_orchestrator
 from .security.audit import SecurityAuditor
 
-
 BANNER = """
     SandFish - Multi-agent swarm intelligence
     ==========================================
@@ -170,8 +169,9 @@ def cmd_orchestrator(args: argparse.Namespace) -> int:
 def cmd_api(args: argparse.Namespace) -> int:
     print_banner()
     try:
-        from .api.main import check_bind_allowed, configure_app
         import uvicorn
+
+        from .api.main import check_bind_allowed, configure_app
     except ImportError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         print("Install API extras with: pip install 'fastapi uvicorn[standard]'", file=sys.stderr)
