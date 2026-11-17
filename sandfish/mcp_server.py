@@ -13,6 +13,12 @@ Tools: sf_create_simulation, sf_start, sf_pause, sf_resume, sf_stop,
 sf_status, sf_list, sf_results, sf_report, sf_memory_search,
 sf_memory_entity.
 
+Opt-in parameter search (``sandfish.search``): sf_search_evaluators,
+sf_search_run, sf_search_ledger, sf_search_summary, sf_search_validate.
+Evaluators are looked up by name only (registered in-process or installed
+under the ``sandfish.evaluators`` entry-point group; ``toy`` is built in).
+Ledgers are written to ``<vault>/search_ledgers/<search_id>.jsonl``.
+
 Resources: ``sandfish://events`` (recent orchestrator events, newest last)
 and ``sandfish://events/{simulation_id}`` (one simulation's events).
 
@@ -28,10 +34,13 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
+import uuid
 from collections import deque
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 
 try:
@@ -52,6 +61,19 @@ from .core.orchestrator import (
     SwarmOrchestrator,
 )
 from .memory.ompa_adapter import OMPAMemoryAdapter
+from .search import (
+    TrialLedger,
+    attach_search,
+    available_evaluators,
+    get_evaluator,
+    grid_size,
+    register_search_agents,
+    run_grid,
+    summarize,
+    validate_holdout,
+    validate_space,
+)
+from .search.ledger import LedgerIntegrityError
 
 logger = logging.getLogger("sandfish.mcp")
 
@@ -60,14 +82,45 @@ MAX_EVENTS_PER_READ = 500
 MAX_SEARCH_LIMIT = 50
 MAX_WAIT_SECONDS = 300.0
 MAX_REPORT_AGENTS = 50
+MAX_LEDGER_ROWS_PER_READ = 500
+MAX_LIVE_SEARCHES = 200
+DEFAULT_MAX_SEARCH_EVALUATIONS = 10_000
+_SEARCH_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 INSTRUCTIONS = (
     "SandFish runs round-based multi-agent social simulations with OMPA memory. "
     "Typical flow: sf_create_simulation -> sf_start (optionally wait_seconds) -> "
     "sf_status / sf_results / sf_report; sf_memory_search and sf_memory_entity "
     "read what agents remembered. Agent ids look like '<simulation_id>_agent_<n>'. "
-    "Read sandfish://events for the event log."
+    "Read sandfish://events for the event log. "
+    "Opt-in parameter search: sf_search_evaluators -> sf_search_run (strategy "
+    "'grid' when the space is small enough to enumerate, else 'swarm') -> "
+    "sf_search_summary / sf_search_ledger -> sf_search_validate (held-out test "
+    "split). SandFish only orchestrates and logs; scores come from the external "
+    "evaluator. Use the ledger's unique-variant count as N for multiple-testing "
+    "corrections."
 )
+
+
+def max_search_evaluations(env: Optional[Dict[str, str]] = None) -> int:
+    env = os.environ if env is None else env
+    raw = str(env.get("SANDFISH_MAX_SEARCH_EVALUATIONS", DEFAULT_MAX_SEARCH_EVALUATIONS)).strip()
+    value = int(raw)
+    return value if value > 0 else DEFAULT_MAX_SEARCH_EVALUATIONS
+
+
+@dataclass
+class SearchRun:
+    search_id: str
+    strategy: str
+    ledger: TrialLedger
+    evaluator: Any
+    evaluator_name: str
+    space: Dict[str, List[Any]]
+    min_n: int = 0
+    simulation_id: Optional[str] = None
+    task: Optional["asyncio.Task[Any]"] = None  # grid searches
+    stop: bool = False
 
 
 def _now() -> str:
@@ -96,6 +149,8 @@ class SandfishMCP:
         self.tasks: Dict[str, "asyncio.Task[Any]"] = {}
         self.events: Deque[Dict[str, Any]] = deque(maxlen=EVENT_LOG_SIZE)
         self._seq = 0
+        self.searches: Dict[str, SearchRun] = {}
+        self.ledger_dir = Path(self.vault_path) / "search_ledgers"
 
     # ----- event log -----
 
@@ -228,7 +283,85 @@ class SandfishMCP:
             ],
         }
 
+    # ----- parameter search -----
+
+    def add_search(self, run: SearchRun) -> None:
+        """Track a live search; forget the oldest finished ones beyond the cap
+        (their ledgers stay on disk and remain readable)."""
+        self.searches[run.search_id] = run
+        for sid in list(self.searches):
+            if len(self.searches) <= MAX_LIVE_SEARCHES:
+                break
+            if sid != run.search_id and not self.search_running(sid):
+                del self.searches[sid]
+
+    def search_running(self, search_id: str) -> bool:
+        run = self.searches.get(search_id)
+        if run is None:
+            return False
+        if run.task is not None:
+            return not run.task.done()
+        if run.simulation_id is not None:
+            sim = self.orchestrator.simulations.get(run.simulation_id)
+            task = self.tasks.get(run.simulation_id)
+            if task is not None and not task.done():
+                return True
+            return sim is not None and sim["status"] in (
+                SimulationStatus.PENDING, SimulationStatus.RUNNING, SimulationStatus.PAUSING,
+                SimulationStatus.PAUSED)
+        return False
+
+    def ledger_path(self, search_id: str) -> Path:
+        if not isinstance(search_id, str) or not _SEARCH_ID_RE.fullmatch(search_id):
+            raise ToolError("search_id must be 1-64 characters of [A-Za-z0-9_-]")
+        return self.ledger_dir / f"{search_id}.jsonl"
+
+    def search_ledger(self, search_id: str) -> TrialLedger:
+        """A live search's ledger, or a ledger file left by an earlier server."""
+        run = self.searches.get(search_id)
+        if run is not None:
+            return run.ledger
+        path = self.ledger_path(search_id)
+        if not path.exists():
+            raise ToolError(f"Unknown search_id {search_id!r}")
+        try:
+            return TrialLedger(path)
+        except LedgerIntegrityError as exc:
+            raise ToolError(f"Ledger failed verification: {exc}") from exc
+
+    def search_status(self, search_id: str) -> Dict[str, Any]:
+        run = self.searches.get(search_id)
+        if run is None:
+            return {"search_id": search_id, "strategy": None, "status": "on_disk", "live": False}
+        out: Dict[str, Any] = {
+            "search_id": search_id,
+            "strategy": run.strategy,
+            "evaluator": run.evaluator_name,
+            "space": run.space,
+            "grid_size": grid_size(run.space),
+            "min_n": run.min_n,
+            "live": True,
+            "ledger_file": os.path.relpath(self.ledger_path(search_id), self.vault_path),
+        }
+        if run.simulation_id is not None:
+            out["simulation_id"] = run.simulation_id
+            if run.simulation_id in self.orchestrator.simulations:
+                st = self.status(run.simulation_id)
+                out.update(status=st["status"], rounds_completed=st.get("rounds_completed"),
+                           error=st.get("error"))
+            else:
+                out["status"] = "finished"  # evicted from the simulation registry
+        elif run.task is not None and not run.task.done():
+            out["status"] = "running"
+        elif run.task is not None and not run.task.cancelled() and run.task.exception() is not None:
+            out.update(status="failed", error=str(run.task.exception()))
+        else:
+            out["status"] = "stopped" if run.stop else "completed"
+        return out
+
     def close(self) -> None:
+        for run in self.searches.values():
+            run.stop = True
         for task in self.tasks.values():
             task.cancel()
         self.orchestrator.close()
@@ -466,6 +599,208 @@ def build_server(
             }
 
         return await asyncio.to_thread(_lookup)
+
+    @server.tool(
+        name="sf_search_evaluators",
+        description=(
+            "Opt-in parameter search: list the external evaluators that can be used by "
+            "name (built-in 'toy' plus installed 'sandfish.evaluators' plugins)."
+        ),
+    )
+    async def sf_search_evaluators() -> dict[str, Any]:
+        names = available_evaluators()
+        info = []
+        for n in names:
+            item: dict[str, Any] = {"name": n}
+            if n == "toy":
+                from .search import ToyQuadraticEvaluator
+
+                item["default_space"] = ToyQuadraticEvaluator.DEFAULT_SPACE
+                item["description"] = "Synthetic quadratic with split-specific noise (tests and docs)."
+            info.append(item)
+        return {"evaluators": info, "count": len(info),
+                "max_evaluations": max_search_evaluations()}
+
+    @server.tool(
+        name="sf_search_run",
+        description=(
+            "Start a parameter search with a named external evaluator on the train split. "
+            "strategy 'grid' evaluates every variant (use it whenever the space is small "
+            "enough to enumerate); 'swarm' runs researcher agents for num_agents x max_rounds "
+            "evaluations. Both run in the background; wait_seconds (max 300) waits for the "
+            "result. space maps parameter -> "
+            "list of values (default: the evaluator's default space). Every evaluation, "
+            "repeats included, goes to an append-only hash-chained ledger."
+        ),
+    )
+    async def sf_search_run(
+        evaluator: str = "toy",
+        strategy: str = "swarm",
+        space: Optional[Dict[str, List[Any]]] = None,
+        evaluator_options: Optional[Dict[str, Any]] = None,
+        num_agents: int = 4,
+        max_rounds: int = 10,
+        seed: Optional[int] = None,
+        min_n: int = 0,
+        name: str = "search",
+        wait_seconds: float = 0.0,
+    ) -> dict[str, Any]:
+        if strategy not in ("swarm", "grid"):
+            raise ToolError("strategy must be 'swarm' or 'grid'")
+        if not name.strip() or len(name) > 100:
+            raise ToolError("name must be 1-100 characters")
+        if min_n < 0:
+            raise ToolError("min_n must be >= 0")
+        try:
+            ev = get_evaluator(evaluator, **(evaluator_options or {}))
+        except KeyError as exc:
+            raise ToolError(str(exc.args[0])) from exc
+        except Exception as exc:  # noqa: BLE001 - plugin factories may raise anything
+            raise ToolError(f"Could not build evaluator {evaluator!r}: {exc}") from exc
+        if space is None:
+            space = getattr(ev, "DEFAULT_SPACE", None)
+            if space is None:
+                raise ToolError("space is required for this evaluator")
+        try:
+            space = validate_space(space)
+        except ValueError as exc:
+            raise ToolError(str(exc)) from exc
+        cap = max_search_evaluations()
+
+        if strategy == "grid":
+            size = grid_size(space)
+            if size > cap:
+                raise ToolError(
+                    f"grid has {size} variants; the limit is {cap} (SANDFISH_MAX_SEARCH_EVALUATIONS)"
+                )
+            search_id = f"grid-{uuid.uuid4().hex[:12]}"
+            ledger = TrialLedger(app.ledger_path(search_id))
+            run = SearchRun(search_id, "grid", ledger, ev, evaluator, space, min_n)
+            run.task = asyncio.create_task(asyncio.to_thread(
+                run_grid, space, ev, ledger, max_variants=cap, run_id=search_id,
+                min_n=min_n, should_stop=lambda: run.stop,
+            ))
+
+            def _grid_done(t: "asyncio.Task[Any]") -> None:
+                err = None if t.cancelled() else t.exception()
+                app.log_event("search_ended", None, search_id=search_id, trials=len(ledger),
+                              error=str(err) if err else None)
+
+            run.task.add_done_callback(_grid_done)
+            app.add_search(run)
+            app.log_event("search_started", None, search_id=search_id, strategy="grid", evaluator=evaluator)
+            if wait_seconds > 0:
+                try:
+                    await asyncio.wait_for(asyncio.shield(run.task),
+                                           timeout=min(wait_seconds, MAX_WAIT_SECONDS))
+                except asyncio.TimeoutError:
+                    pass
+                except Exception:
+                    pass  # reported through the status
+            summary = await asyncio.to_thread(summarize, ledger, min_n=min_n)
+            return {**app.search_status(search_id), **summary}
+
+        if num_agents < 1 or max_rounds < 1:
+            raise ToolError("num_agents and max_rounds must be >= 1")
+        if num_agents * max_rounds > cap:
+            raise ToolError(
+                f"num_agents x max_rounds = {num_agents * max_rounds} exceeds the limit of "
+                f"{cap} evaluations (SANDFISH_MAX_SEARCH_EVALUATIONS)"
+            )
+        register_search_agents()
+        config = SimulationConfig(
+            name=name, num_agents=num_agents, max_rounds=max_rounds, seed=seed,
+            agent_types=["researcher_explorer", "researcher_exploiter"], checkpoint_interval=0,
+        )
+        try:
+            sim_id = app.orchestrator.create_simulation(config)
+        except (ValueError, SimulationLimitError) as exc:
+            raise ToolError(str(exc)) from exc
+        ledger = TrialLedger(app.ledger_path(sim_id))
+        attach_search(app.orchestrator, sim_id, space=space, evaluator=ev, ledger=ledger, min_n=min_n)
+        app.add_search(SearchRun(sim_id, "swarm", ledger, ev, evaluator, space, min_n, sim_id))
+        app.spawn(sim_id)
+        app.log_event("search_started", sim_id, search_id=sim_id, strategy="swarm", evaluator=evaluator)
+        await app.wait(sim_id, wait_seconds)
+        summary = await asyncio.to_thread(summarize, ledger, min_n=min_n)
+        return {**app.search_status(sim_id), **summary}
+
+    @server.tool(
+        name="sf_search_ledger",
+        description=(
+            "Read rows of a search's trial ledger (oldest first; offset/limit, max 500; "
+            "optional split 'train' or 'test'), with exact counts and the hash-chain check."
+        ),
+    )
+    async def sf_search_ledger(
+        search_id: str, offset: int = 0, limit: int = 50, split: Optional[str] = None
+    ) -> dict[str, Any]:
+        if split not in (None, "train", "test"):
+            raise ToolError("split must be 'train', 'test' or omitted")
+        n = max(1, min(int(limit), MAX_LEDGER_ROWS_PER_READ))
+        start = max(0, int(offset))
+
+        def _read() -> dict[str, Any]:
+            ledger = app.search_ledger(search_id)
+            rows = ledger.rows(start, n, split=split)
+            return {
+                "search_id": search_id,
+                "offset": start,
+                "returned": len(rows),
+                "rows": rows,
+                "counts": ledger.counts(),
+                "integrity": ledger.verify(),
+            }
+
+        return await asyncio.to_thread(_read)
+
+    @server.tool(
+        name="sf_search_summary",
+        description=(
+            "Summarise a search: exact trial counts (every evaluation, repeats included; "
+            "unique variants per split), ledger integrity, best and top train variants with "
+            "any test scores, and the N to use for multiple-testing corrections."
+        ),
+    )
+    async def sf_search_summary(search_id: str, top: int = 5) -> dict[str, Any]:
+        run = app.searches.get(search_id)
+        k = max(1, min(int(top), MAX_REPORT_AGENTS))
+        summary = await asyncio.to_thread(
+            lambda: summarize(app.search_ledger(search_id), top=k, min_n=run.min_n if run else 0)
+        )
+        return {**app.search_status(search_id), **summary}
+
+    @server.tool(
+        name="sf_search_validate",
+        description=(
+            "Score finalists on the held-out 'test' split: the top_k train variants (or the "
+            "given variants). Test evaluations are logged in the same ledger. Choose finalists "
+            "before calling; repeated peeking is visible in the ledger."
+        ),
+    )
+    async def sf_search_validate(
+        search_id: str, top_k: int = 3, variants: Optional[List[Dict[str, Any]]] = None
+    ) -> dict[str, Any]:
+        run = app.searches.get(search_id)
+        if run is None:
+            raise ToolError("Validation needs a search started by this server (its evaluator is in memory)")
+        if app.search_running(search_id):
+            raise ToolError("Search is still running; validate after it finishes")
+        k = max(1, min(int(top_k), MAX_REPORT_AGENTS))
+        if variants is not None:
+            if not variants or len(variants) > MAX_REPORT_AGENTS:
+                raise ToolError(f"variants must list 1-{MAX_REPORT_AGENTS} variants")
+            try:
+                for v in variants:
+                    validate_space({key: [val] for key, val in v.items()})
+            except (ValueError, AttributeError) as exc:
+                raise ToolError(f"invalid variant: {exc}") from exc
+        results = await asyncio.to_thread(
+            validate_holdout, run.ledger, run.evaluator, top_k=k, min_n=run.min_n,
+            variants=variants, run_id=search_id,
+        )
+        app.log_event("search_validated", run.simulation_id, search_id=search_id, finalists=len(results))
+        return {"search_id": search_id, "results": results, "counts": run.ledger.counts()}
 
     @server.resource(
         "sandfish://events",

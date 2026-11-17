@@ -4,6 +4,7 @@ Tests for agent definitions.
 
 from __future__ import annotations
 
+import random
 from unittest.mock import Mock
 
 import pytest
@@ -149,12 +150,14 @@ class TestAgentTypes:
     @pytest.mark.asyncio
     async def test_lurker_agent_prefers_passive(self, mock_memory):
         profile = AgentProfile(name="Lurker", agent_type="lurker")
-        agent = LurkerAgent("id3", profile, mock_memory)
+        # Seeded and with more draws: unseeded, 200 draws at p=0.5 failed
+        # "> 80" in roughly 0.3% of runs (a CI flake).
+        agent = LurkerAgent("id3", profile, mock_memory, rng=random.Random(1))
         await agent.initialize({})
 
-        actions = [await agent.decide_action() for _ in range(200)]
+        actions = [await agent.decide_action() for _ in range(1000)]
         do_nothings = sum(1 for a in actions if a.action_type == ActionType.DO_NOTHING)
-        assert do_nothings > 80
+        assert do_nothings > 400  # expected 500
 
 
 class TestAgentFactory:
