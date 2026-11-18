@@ -129,3 +129,24 @@ def test_package_inits_have_empty_docstrings():
 
     assert not sandfish.kits.__doc__
     assert not sandfish.kits.energy.__doc__
+
+
+@pytest.mark.parametrize("day", [date(2024, 10, 6), date(2024, 4, 7)])
+def test_earliest_valid_lag_half_hour_dst_raises(day):
+    with pytest.raises(ValueError) as exc:
+        earliest_valid_lag([day], "Australia/Lord_Howe")
+    assert "Australia/Lord_Howe" in str(exc.value)
+    assert day.isoformat() in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "tz,day,lag",
+    [
+        ("America/Los_Angeles", date(2024, 3, 10), 37),
+        ("America/Los_Angeles", date(2024, 11, 3), 39),
+        ("America/Phoenix", date(2024, 3, 10), 38),
+        ("Pacific/Honolulu", date(2024, 11, 3), 38),
+    ],
+)
+def test_earliest_valid_lag_us_zones_unchanged(tz, day, lag):
+    assert earliest_valid_lag([day], tz) == lag

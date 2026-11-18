@@ -79,11 +79,30 @@ def valid_variant(variant: Mapping[str, Any]) -> bool:
         return False
 
 
+def _require_whole_hour_day(d: date, tz: str) -> None:
+    """Raise ``ValueError`` if local day ``d`` is not a whole number of hours long."""
+    zone = ZoneInfo(tz)
+    start = datetime(d.year, d.month, d.day, tzinfo=zone).astimezone(timezone.utc)
+    nxt = d + timedelta(days=1)
+    end = datetime(nxt.year, nxt.month, nxt.day, tzinfo=zone).astimezone(timezone.utc)
+    seconds = (end - start).total_seconds()
+    if seconds % 3600:
+        raise ValueError(
+            f"local day {d.isoformat()} in {tz} is {seconds / 3600:g} hours long, "
+            "not a whole number of hours (half-hour DST shifts are unsupported)"
+        )
+
+
 def earliest_valid_lag(days: Iterable[date], tz: str = TZ) -> int:
-    """Maximum ``min_lag_hours`` over every real hour of every given local day."""
+    """Maximum ``min_lag_hours`` over every real hour of every given local day.
+
+    Raises ``ValueError`` for a day that is not a whole number of hours long
+    (an unsupported half-hour DST shift such as Australia/Lord_Howe).
+    """
     zone = ZoneInfo(tz)
     worst: Optional[int] = None
     for d in days:
+        _require_whole_hour_day(d, tz)
         # Scan a UTC window wide enough for any offset and keep every hour whose
         # local date is d; a rollback across midnight can revisit d later.
         t = datetime(d.year, d.month, d.day, tzinfo=timezone.utc) - timedelta(hours=30)
