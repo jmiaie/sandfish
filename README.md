@@ -236,7 +236,8 @@ sandfish-mcp --vault ./sandfish_vault
 | `sf_search_run` | Start a parameter search: `strategy` `grid` or `swarm`, `evaluator`, `space`, `seed`, … |
 | `sf_search_ledger` | Read trial-ledger rows (paged, optional `split`) with counts and the hash-chain check |
 | `sf_search_summary` | Exact trial counts, integrity, best/top train variants and any test scores |
-| `sf_search_validate` | Score finalists on the held-out `test` split (logged in the same ledger) |
+| `sf_search_validate` | Score finalists on the held-out `test` split (logged in the same ledger); `dedupe_metadata_fields` drops duplicate finalists |
+| `sf_search_overfit` | Holdout-guard status, train-vs-test degradation, walk-forward runs and (for Sharpe scores) the Deflated Sharpe Ratio using the ledger's N |
 
 Resources:
 
@@ -393,6 +394,45 @@ factory (so plugin factories must treat them as untrusted), and ledgers are
 written to `<vault>/search_ledgers/<search_id>.jsonl`, where
 `sf_search_ledger` / `sf_search_summary` can still read them after a restart.
 `sf_search_validate` refuses while a search is still running or paused.
+
+### Robustness and overfitting checks
+
+Everything here is opt-in and leaves the default paths unchanged.
+
+- **Invalid combinations:** `run_grid(space, ev, ledger, valid=lambda v: v["fast"] < v["slow"])`
+  skips combinations that make no sense. They are never evaluated or recorded,
+  so the ledger's N counts hypotheses actually tested (the result reports
+  `grid_size`, `valid_size` and `skipped_invalid`).
+- **Not scorable:** return `EvaluationResult.not_scorable(n=3, reason="too few
+  trades")` (or `{"score": None}`) when the sample is too small to score. The
+  trial is recorded and counted in N, but `best()`/`top()`, the researcher
+  agents and `validate_holdout` never rank it. Use this instead of a fake `0.0`.
+- **Deterministic content head:** `ledger.content_head()` hashes each row
+  without its timestamp, run id and chain hashes, so two identical, seeded
+  runs give the same content head even though their `head` differs.
+- **Duplicate finalists:** `validate_holdout(..., dedupe_key=dedupe_by_metadata("trade_set_hash"))`
+  (or `dedupe_by_score(params=[...])`, or your own `row -> fingerprint`) keeps
+  near-identical finalists from filling `top_k`; dropped ones are listed in
+  `result.skipped`.
+- **Locked holdout:** `ledger.lock_holdout()` (or `lock_holdout=True` on
+  `run_grid`/`run_search`/`sf_search_run`) makes `validate_holdout` the only
+  way to score the test split, once. Any other attempt raises
+  `HoldoutLockedError` before the evaluator runs. The lock, each denied
+  attempt and the validation are written to the ledger as *event rows* in the
+  same hash chain (they are not trials and never count towards N). A second
+  validation needs `allow_repeat=True` and is logged as a reopening.
+- **Statistics** (`sandfish.search.overfit`, formulas cited in the docstrings;
+  checked against independently computed reference values in the tests):
+  `deflated_sharpe_ratio` / `ledger_deflated_sharpe` (Bailey & López de Prado,
+  2014; give `score_is_sharpe=True`, since SandFish cannot know what a score
+  means), `probability_of_backtest_overfitting` (CSCV, Bailey et al., 2017;
+  needs a T x N returns matrix, so it is Python-only), `make_walk_forward_folds`
+  and `walk_forward` (rolling or expanding windows, with an embargo; your
+  evaluator implements `evaluate_fold(variant, fold)` on train-split data), and
+  `holdout_report`. `summarize(ledger, overfit={"score_is_sharpe": True})` and
+  `sf_search_overfit` bundle what a ledger alone can answer. These are
+  diagnostics, not guarantees: they assume trials are roughly independent and
+  N is honest.
 
 ## Docker
 

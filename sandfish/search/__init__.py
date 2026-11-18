@@ -32,12 +32,46 @@ from .evaluator import (
     register_evaluator,
     unregister_evaluator,
 )
-from .ledger import GENESIS, LedgerIntegrityError, TrialLedger, variant_key, verify_ledger_file
-from .runner import MULTIPLE_TESTING_NOTE, run_grid, run_search, summarize, validate_holdout
+from .ledger import (
+    GENESIS,
+    HoldoutLockedError,
+    LedgerIntegrityError,
+    TrialLedger,
+    variant_key,
+    verify_ledger_file,
+)
+from .overfit import (
+    Fold,
+    deflated_sharpe_ratio,
+    expected_max_sharpe,
+    holdout_report,
+    ledger_deflated_sharpe,
+    make_walk_forward_folds,
+    overfit_report,
+    probabilistic_sharpe_ratio,
+    probability_of_backtest_overfitting,
+    sharpe_stats,
+    walk_forward,
+)
+from .runner import (
+    MULTIPLE_TESTING_NOTE,
+    HoldoutResults,
+    dedupe_by_metadata,
+    dedupe_by_score,
+    run_grid,
+    run_search,
+    summarize,
+    validate_holdout,
+)
 from .space import grid_size, iter_grid, validate_space
 
 __all__ = [
-    "ENTRY_POINT_GROUP", "GENESIS", "MULTIPLE_TESTING_NOTE", "SEARCH_AGENT_TYPES", "SPLITS",
+    "ENTRY_POINT_GROUP", "Fold", "GENESIS", "HoldoutLockedError", "HoldoutResults",
+    "MULTIPLE_TESTING_NOTE", "SEARCH_AGENT_TYPES", "SPLITS", "dedupe_by_metadata",
+    "dedupe_by_score", "deflated_sharpe_ratio", "expected_max_sharpe", "holdout_report",
+    "ledger_deflated_sharpe", "make_walk_forward_folds", "overfit_report",
+    "probabilistic_sharpe_ratio", "probability_of_backtest_overfitting", "sharpe_stats",
+    "walk_forward",
     "TEST", "TRAIN", "EvaluationResult", "Evaluator", "ExploiterAgent", "ExplorerAgent",
     "FunctionEvaluator", "LedgerIntegrityError", "ResearcherAgent", "SearchContext",
     "ToyQuadraticEvaluator", "TrialLedger", "as_evaluator", "attach_search",
