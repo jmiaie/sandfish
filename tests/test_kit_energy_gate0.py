@@ -89,6 +89,35 @@ def test_local_day_hours(day, hours):
     assert local_day_hours(day) == hours
 
 
+@pytest.mark.parametrize("day", [date(2024, 10, 6), date(2024, 4, 7)])
+def test_local_day_hours_half_hour_dst_raises(day):
+    with pytest.raises(ValueError) as exc:
+        local_day_hours(day, "Australia/Lord_Howe")
+    assert "Australia/Lord_Howe" in str(exc.value)
+    assert day.isoformat() in str(exc.value)
+
+
+def test_local_day_hours_half_hour_zone_ordinary_day():
+    # Lord Howe has a 30-minute DST shift, but an ordinary day is still 24 h.
+    assert local_day_hours(date(2024, 7, 1), "Australia/Lord_Howe") == 24
+
+
+@pytest.mark.parametrize(
+    "tz,day,hours",
+    [
+        ("America/Los_Angeles", date(2024, 3, 10), 23),
+        ("America/Los_Angeles", date(2024, 11, 3), 25),
+        ("America/Phoenix", date(2024, 3, 10), 24),
+        ("America/Phoenix", date(2024, 11, 3), 24),
+        ("Pacific/Honolulu", date(2024, 3, 10), 24),
+        ("Pacific/Honolulu", date(2024, 11, 3), 24),
+        ("America/St_Johns", date(2024, 3, 10), 23),
+    ],
+)
+def test_local_day_hours_us_zones_unchanged(tz, day, hours):
+    assert local_day_hours(day, tz) == hours
+
+
 def test_check_ba_overlap():
     r = check_ba(_fixture())
     assert r["has_D"] and r["has_DF"]

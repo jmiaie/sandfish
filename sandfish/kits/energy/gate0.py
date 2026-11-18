@@ -111,11 +111,21 @@ def summarize_series(data: Sequence[Sequence[Any]]) -> dict:
 
 
 def local_day_hours(day: date, tz: str = "America/Los_Angeles") -> int:
-    """Return the number of elapsed hours (23, 24 or 25) in a local calendar day."""
+    """Return the number of elapsed hours (23, 24 or 25) in a local calendar day.
+
+    Raises ``ValueError`` naming the zone and date when the day is not a whole
+    number of hours long (an unsupported half-hour DST shift, e.g. Lord Howe).
+    """
     zone = ZoneInfo(tz)
     start = datetime.combine(day, time(0), tzinfo=zone).astimezone(timezone.utc)
     nxt = datetime.combine(day + timedelta(days=1), time(0), tzinfo=zone)
-    return int((nxt.astimezone(timezone.utc) - start) / _HOUR)
+    seconds = (nxt.astimezone(timezone.utc) - start).total_seconds()
+    if seconds % 3600:
+        raise ValueError(
+            f"local day {day.isoformat()} in {tz} is {seconds / 3600:g} hours long, "
+            "not a whole number of hours (half-hour DST shifts are unsupported)"
+        )
+    return int(seconds // 3600)
 
 
 def check_ba(lines: Iterable[str], ba: str = "CISO") -> dict:
