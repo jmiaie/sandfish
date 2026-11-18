@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from ..agents.base_agent import Action, ActionType, BaseAgent, register_agent_type
 from .evaluator import (
+    TEST,
     TRAIN,
     EvaluationResult,
     Evaluator,
@@ -79,8 +80,15 @@ def evaluate_and_record(
     """Score ``variant`` (or reuse an earlier result) and append a ledger row.
 
     Evaluator exceptions are recorded as an ``error`` row, never raised: a
-    failed evaluation is still a trial and must be counted.
+    failed evaluation is still a trial and must be counted. A not-scorable
+    result (``score=None``) is recorded and counted too, but never ranked.
+
+    If the ledger's holdout guard is on, evaluating the test split from
+    anywhere but :func:`validate_holdout` raises ``HoldoutLockedError`` before
+    the evaluator is called (and the attempt is logged).
     """
+    if split == TEST:
+        ctx.ledger.check_holdout(split, source, variant)
     try:
         json.dumps(dict(variant), allow_nan=False, default=str)
     except (TypeError, ValueError) as exc:
@@ -146,7 +154,8 @@ class ResearcherAgent(BaseAgent):
             evaluate_and_record, ctx, variant, source=self.id, round_number=self.round_number
         )
         action.metadata["ledger_seq"] = row["seq"]
-        if ctx.remember and self.memory is not None and not row["cached"] and row["result"]:
+        if (ctx.remember and self.memory is not None and not row["cached"] and row["result"]
+                and row["result"]["score"] is not None):
             try:
                 self.memory.add_entity(
                     name=f"variant:{variant_key(variant)}",

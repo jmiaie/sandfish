@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import itertools
 import math
-from typing import Any, Dict, Iterator, List, Mapping
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional
 
 MAX_PARAMS = 32
 MAX_VALUES_PER_PARAM = 1000
@@ -46,8 +46,16 @@ def grid_size(space: Mapping[str, List[Any]]) -> int:
     return math.prod(len(v) for v in space.values())
 
 
-def iter_grid(space: Mapping[str, List[Any]]) -> Iterator[Dict[str, Any]]:
-    """Every variant, in a fixed order (sorted parameter names, listed value order)."""
+def iter_grid(
+    space: Mapping[str, List[Any]], valid: Optional[Callable[[Dict[str, Any]], bool]] = None
+) -> Iterator[Dict[str, Any]]:
+    """Every variant, in a fixed order (sorted parameter names, listed value order).
+
+    With ``valid``, combinations for which ``valid(variant)`` is falsy are
+    skipped (the predicate gets a fresh dict it may keep or modify).
+    """
     keys = sorted(space)
     for combo in itertools.product(*(space[k] for k in keys)):
-        yield dict(zip(keys, combo))
+        variant = dict(zip(keys, combo))
+        if valid is None or valid(dict(variant)):
+            yield variant

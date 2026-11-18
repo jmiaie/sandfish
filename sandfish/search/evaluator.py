@@ -41,11 +41,32 @@ ENTRY_POINT_GROUP = "sandfish.evaluators"
 @dataclass(frozen=True)
 class EvaluationResult:
     """One evaluation. ``n`` is the sample size behind the score, if any
-    (e.g. number of observations); searches can require ``n >= min_n``."""
+    (e.g. number of observations); searches can require ``n >= min_n``.
 
-    score: float
+    ``score=None`` means *not scorable*: the evaluator ran but the sample was
+    too small to give a meaningful score (see :meth:`not_scorable`). Such a
+    result is still a trial (it is recorded and counted in N) but it is never
+    ranked: ``best()``/``top()`` and the researcher agents skip it. Use this
+    instead of a fake ``0.0``, which would rank as a real score.
+    """
+
+    score: Optional[float]
     n: Optional[int] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def scorable(self) -> bool:
+        return self.score is not None
+
+    @classmethod
+    def not_scorable(
+        cls, n: Optional[int] = None, reason: Optional[str] = None, **metadata: Any
+    ) -> "EvaluationResult":
+        """A recorded-but-unranked result (e.g. too few trades to score)."""
+        meta = dict(metadata)
+        if reason is not None:
+            meta["not_scorable_reason"] = reason
+        return cls(score=None, n=n, metadata=meta)
 
     def to_dict(self) -> Dict[str, Any]:
         return {"score": self.score, "n": self.n, "metadata": dict(self.metadata)}
@@ -53,24 +74,29 @@ class EvaluationResult:
     @classmethod
     def coerce(cls, value: Any) -> "EvaluationResult":
         """Accept an EvaluationResult, or a mapping with a numeric ``score``
-        (an optional ``n`` and ``metadata``; any other keys go into metadata)."""
+        (an optional ``n`` and ``metadata``; any other keys go into metadata).
+
+        A mapping may give ``"score": None`` or ``"scorable": False`` for a
+        not-scorable result (see the class docstring)."""
         if isinstance(value, EvaluationResult):
             result = value
         elif isinstance(value, Mapping):
-            if "score" not in value:
+            unscorable = value.get("scorable") is False
+            if "score" not in value and not unscorable:
                 raise ValueError("evaluator result must include a 'score'")
-            extra = {k: v for k, v in value.items() if k not in ("score", "n", "metadata")}
+            extra = {k: v for k, v in value.items() if k not in ("score", "n", "metadata", "scorable")}
             meta = dict(value.get("metadata") or {})
             meta.update(extra)
-            result = cls(score=value["score"], n=value.get("n"), metadata=meta)
+            result = cls(score=None if unscorable else value["score"], n=value.get("n"), metadata=meta)
         else:
             raise ValueError(
                 f"evaluator must return EvaluationResult or a mapping, not {type(value).__name__}"
             )
-        if isinstance(result.score, bool) or not isinstance(result.score, (int, float)):
-            raise ValueError("score must be a number")
-        if not math.isfinite(float(result.score)):
-            raise ValueError("score must be finite")
+        if result.score is not None:
+            if isinstance(result.score, bool) or not isinstance(result.score, (int, float)):
+                raise ValueError("score must be a number or None (not scorable)")
+            if not math.isfinite(float(result.score)):
+                raise ValueError("score must be finite")
         if result.n is not None and (isinstance(result.n, bool) or not isinstance(result.n, int)):
             raise ValueError("n must be an integer or None")
         # Metadata goes into the ledger verbatim: it must be JSON-serialisable
@@ -79,7 +105,9 @@ class EvaluationResult:
             meta = json.loads(json.dumps(dict(result.metadata), default=str, allow_nan=False))
         except (TypeError, ValueError) as exc:
             raise ValueError(f"metadata is not JSON-serialisable: {exc}") from exc
-        return cls(score=float(result.score), n=result.n, metadata=meta)
+        return cls(
+            score=None if result.score is None else float(result.score), n=result.n, metadata=meta
+        )
 
 
 @runtime_checkable

@@ -14,7 +14,8 @@ sf_status, sf_list, sf_results, sf_report, sf_memory_search,
 sf_memory_entity.
 
 Opt-in parameter search (``sandfish.search``): sf_search_evaluators,
-sf_search_run, sf_search_ledger, sf_search_summary, sf_search_validate.
+sf_search_run, sf_search_ledger, sf_search_summary, sf_search_validate,
+sf_search_overfit.
 Evaluators are looked up by name only (registered in-process or installed
 under the ``sandfish.evaluators`` entry-point group; ``toy`` is built in).
 Ledgers are written to ``<vault>/search_ledgers/<search_id>.jsonl``.
@@ -73,7 +74,9 @@ from .search import (
     validate_holdout,
     validate_space,
 )
-from .search.ledger import LedgerIntegrityError
+from .search.ledger import HoldoutLockedError, LedgerIntegrityError
+from .search.overfit import overfit_report
+from .search.runner import dedupe_by_metadata
 
 logger = logging.getLogger("sandfish.mcp")
 
@@ -96,7 +99,9 @@ INSTRUCTIONS = (
     "Opt-in parameter search: sf_search_evaluators -> sf_search_run (strategy "
     "'grid' when the space is small enough to enumerate, else 'swarm') -> "
     "sf_search_summary / sf_search_ledger -> sf_search_validate (held-out test "
-    "split). SandFish only orchestrates and logs; scores come from the external "
+    "split; sf_search_run lock_holdout=true makes it the only way to score it) -> "
+    "sf_search_overfit (Deflated Sharpe Ratio, holdout degradation, guard status). "
+    "SandFish only orchestrates and logs; scores come from the external "
     "evaluator. Use the ledger's unique-variant count as N for multiple-testing "
     "corrections."
 )
@@ -630,7 +635,9 @@ def build_server(
             "evaluations. Both run in the background; wait_seconds (max 300) waits for the "
             "result. space maps parameter -> "
             "list of values (default: the evaluator's default space). Every evaluation, "
-            "repeats included, goes to an append-only hash-chained ledger."
+            "repeats included, goes to an append-only hash-chained ledger. lock_holdout=true "
+            "locks the test split so only sf_search_validate (once) can score it; the lock "
+            "and any denied attempt are logged in the ledger."
         ),
     )
     async def sf_search_run(
@@ -644,6 +651,7 @@ def build_server(
         min_n: int = 0,
         name: str = "search",
         wait_seconds: float = 0.0,
+        lock_holdout: bool = False,
     ) -> dict[str, Any]:
         if strategy not in ("swarm", "grid"):
             raise ToolError("strategy must be 'swarm' or 'grid'")
@@ -675,6 +683,8 @@ def build_server(
                 )
             search_id = f"grid-{uuid.uuid4().hex[:12]}"
             ledger = TrialLedger(app.ledger_path(search_id))
+            if lock_holdout:
+                ledger.lock_holdout(reason="sf_search_run")
             run = SearchRun(search_id, "grid", ledger, ev, evaluator, space, min_n)
             run.task = asyncio.create_task(asyncio.to_thread(
                 run_grid, space, ev, ledger, max_variants=cap, run_id=search_id,
@@ -717,6 +727,8 @@ def build_server(
         except (ValueError, SimulationLimitError) as exc:
             raise ToolError(str(exc)) from exc
         ledger = TrialLedger(app.ledger_path(sim_id))
+        if lock_holdout:
+            ledger.lock_holdout(reason="sf_search_run")
         attach_search(app.orchestrator, sim_id, space=space, evaluator=ev, ledger=ledger, min_n=min_n)
         app.add_search(SearchRun(sim_id, "swarm", ledger, ev, evaluator, space, min_n, sim_id))
         app.spawn(sim_id)
@@ -775,11 +787,18 @@ def build_server(
         description=(
             "Score finalists on the held-out 'test' split: the top_k train variants (or the "
             "given variants). Test evaluations are logged in the same ledger. Choose finalists "
-            "before calling; repeated peeking is visible in the ledger."
+            "before calling; repeated peeking is visible in the ledger. dedupe_metadata_fields "
+            "(e.g. ['trade_set_hash']) drops finalists whose train metadata matches a "
+            "better-ranked one, so duplicates do not fill top_k. If the search was started "
+            "with lock_holdout, this works once unless allow_repeat is true (logged)."
         ),
     )
     async def sf_search_validate(
-        search_id: str, top_k: int = 3, variants: Optional[List[Dict[str, Any]]] = None
+        search_id: str,
+        top_k: int = 3,
+        variants: Optional[List[Dict[str, Any]]] = None,
+        dedupe_metadata_fields: Optional[List[str]] = None,
+        allow_repeat: bool = False,
     ) -> dict[str, Any]:
         run = app.searches.get(search_id)
         if run is None:
@@ -795,12 +814,64 @@ def build_server(
                     validate_space({key: [val] for key, val in v.items()})
             except (ValueError, AttributeError) as exc:
                 raise ToolError(f"invalid variant: {exc}") from exc
-        results = await asyncio.to_thread(
-            validate_holdout, run.ledger, run.evaluator, top_k=k, min_n=run.min_n,
-            variants=variants, run_id=search_id,
-        )
+        dedupe = None
+        if dedupe_metadata_fields:
+            if len(dedupe_metadata_fields) > 8 or not all(
+                isinstance(f, str) and f for f in dedupe_metadata_fields
+            ):
+                raise ToolError("dedupe_metadata_fields must be up to 8 non-empty strings")
+            dedupe = dedupe_by_metadata(*dedupe_metadata_fields)
+        try:
+            results = await asyncio.to_thread(
+                validate_holdout, run.ledger, run.evaluator, top_k=k, min_n=run.min_n,
+                variants=variants, run_id=search_id, dedupe_key=dedupe, allow_repeat=allow_repeat,
+            )
+        except HoldoutLockedError as exc:
+            raise ToolError(str(exc)) from exc
         app.log_event("search_validated", run.simulation_id, search_id=search_id, finalists=len(results))
-        return {"search_id": search_id, "results": results, "counts": run.ledger.counts()}
+        return {"search_id": search_id, "results": list(results), "skipped_duplicates": results.skipped,
+                "counts": run.ledger.counts(), "holdout_guard": run.ledger.holdout_status()}
+
+    @server.tool(
+        name="sf_search_overfit",
+        description=(
+            "Overfitting checks from a search's ledger: holdout-guard status, train-vs-test "
+            "degradation, logged walk-forward runs and, if score_is_sharpe is true, the Deflated "
+            "Sharpe Ratio (Bailey & Lopez de Prado) of the best train variant using the ledger's "
+            "N (unique variants tried, not-scorable ones included). periods_per_year converts "
+            "annualised Sharpe scores to per-period; n_obs, skew and kurtosis default to the "
+            "best result's n and metadata."
+        ),
+    )
+    async def sf_search_overfit(
+        search_id: str,
+        score_is_sharpe: bool = False,
+        periods_per_year: float = 1.0,
+        n_obs: Optional[int] = None,
+        skew: Optional[float] = None,
+        kurtosis: Optional[float] = None,
+        n_trials: Optional[int] = None,
+    ) -> dict[str, Any]:
+        if periods_per_year <= 0:
+            raise ToolError("periods_per_year must be > 0")
+        if n_obs is not None and n_obs < 2:
+            raise ToolError("n_obs must be >= 2")
+        if n_trials is not None and n_trials < 1:
+            raise ToolError("n_trials must be >= 1")
+        run = app.searches.get(search_id)
+
+        def _report() -> dict[str, Any]:
+            ledger = app.search_ledger(search_id)
+            return overfit_report(
+                ledger, score_is_sharpe=score_is_sharpe, periods_per_year=periods_per_year,
+                n_obs=n_obs, skew=skew, kurtosis=kurtosis, min_n=run.min_n if run else 0,
+                n_trials=n_trials)
+
+        try:
+            report = await asyncio.to_thread(_report)
+        except ValueError as exc:
+            raise ToolError(str(exc)) from exc
+        return {"search_id": search_id, **report}
 
     @server.resource(
         "sandfish://events",

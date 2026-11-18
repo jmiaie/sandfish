@@ -17,7 +17,7 @@ EXPECTED_TOOLS = {
     "sf_status", "sf_list", "sf_results", "sf_report",
     "sf_memory_search", "sf_memory_entity",
     "sf_search_evaluators", "sf_search_run", "sf_search_ledger", "sf_search_summary",
-    "sf_search_validate",
+    "sf_search_validate", "sf_search_overfit",
 }
 
 
@@ -452,3 +452,70 @@ async def test_search_grid_background_stop_failure_and_eviction(tmp_path, monkey
     finally:
         app.close()
         unregister_evaluator("unit_slow")
+
+
+@pytest.mark.asyncio
+async def test_search_overfit_tools_lock_dedupe_and_report(server):
+    async with Client(server, cache=None) as c:
+        sid = (await _ok(c, "sf_search_run", strategy="grid", lock_holdout=True,
+                         wait_seconds=30))["search_id"]
+        s = await _ok(c, "sf_search_summary", search_id=sid)
+        assert s["holdout_guard"]["state"] == "locked" and s["holdout_guard"]["clean"]
+        assert s["content_head"] and s["counts"]["n_trials"] == 49
+
+        val = await _ok(c, "sf_search_validate", search_id=sid, top_k=3,
+                        dedupe_metadata_fields=["distance2"])
+        dists = [r["variant"] for r in val["results"]]
+        assert len(dists) == 3 and val["holdout_guard"]["state"] == "consumed"
+        top_dist = {(v["x"] - 1) ** 2 + (v["y"] + 2) ** 2 for v in dists}
+        assert len(top_dist) == 3  # no two finalists share the same distance (trade-set stand-in)
+        assert isinstance(val["skipped_duplicates"], list)
+
+        r = await _call(c, "sf_search_validate", search_id=sid, top_k=3)
+        assert r.is_error and "already consumed" in r.content[0].text
+        again = await _ok(c, "sf_search_validate", search_id=sid, top_k=1, allow_repeat=True)
+        assert len(again["results"]) == 1 and again["holdout_guard"]["validations"] == 2
+
+        rep = await _ok(c, "sf_search_overfit", search_id=sid)
+        assert rep["holdout"]["n_pairs"] >= 3 and rep["n_trials_train"] == 49
+        assert rep["holdout_guard"]["state"] == "consumed"
+        assert rep["deflated_sharpe"]["available"] is False
+        dsr = await _ok(c, "sf_search_overfit", search_id=sid, score_is_sharpe=True, n_obs=100)
+        assert dsr["deflated_sharpe"]["available"] and dsr["deflated_sharpe"]["n_trials"] == 49
+        assert 0.0 <= dsr["deflated_sharpe"]["dsr"] <= 1.0
+
+        # An unguarded search is unchanged: validate can repeat.
+        sid2 = (await _ok(c, "sf_search_run", strategy="grid", space={"x": [0, 1], "y": [0]},
+                          wait_seconds=30))["search_id"]
+        await _ok(c, "sf_search_validate", search_id=sid2, top_k=1)
+        await _ok(c, "sf_search_validate", search_id=sid2, top_k=1)
+
+        for args in ({"periods_per_year": 0}, {"n_obs": 1}, {"n_trials": 0}):
+            r = await _call(c, "sf_search_overfit", search_id=sid, **args)
+            assert r.is_error
+        r = await _call(c, "sf_search_overfit", search_id="missing")
+        assert r.is_error and "Unknown search_id" in r.content[0].text
+        r = await _call(c, "sf_search_overfit", search_id=sid, score_is_sharpe=True, periods_per_year=1,
+                        n_obs=5, n_trials=2)
+        assert not r.is_error
+        r = await _call(c, "sf_search_validate", search_id=sid2, dedupe_metadata_fields=[""])
+        assert r.is_error and "dedupe_metadata_fields" in r.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_search_overfit_reads_ledgers_left_by_an_earlier_server(tmp_path):
+    vault = str(tmp_path / "v")
+    srv = build_server(vault, enable_semantic=False)
+    try:
+        async with Client(srv, cache=None) as c:
+            sid = (await _ok(c, "sf_search_run", strategy="grid", lock_holdout=True,
+                             wait_seconds=30))["search_id"]
+    finally:
+        srv.sandfish.close()
+    srv2 = build_server(vault, enable_semantic=False)
+    try:
+        async with Client(srv2, cache=None) as c:
+            rep = await _ok(c, "sf_search_overfit", search_id=sid)
+            assert rep["holdout_guard"]["state"] == "locked" and rep["holdout"]["n_pairs"] == 0
+    finally:
+        srv2.sandfish.close()
