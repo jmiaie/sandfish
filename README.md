@@ -112,14 +112,23 @@ Available endpoints include:
 - `POST /api/simulations/{id}/pause|resume|stop` — control. A pause reports
   `pausing` until the in-flight round finishes, then `paused`; resume
   continues from the next round (no round is re-run).
-- `GET  /api/simulations/{id}/results` — rounds completed and metrics
-  (including per-simulation LLM calls/tokens when LLM agents are used).
+- `GET  /api/simulations/{id}/agents` — every agent's state: live while the
+  simulation can still run, and the state they ended in once it has finished.
+- `GET  /api/simulations/{id}/results` — rounds completed, metrics (including
+  per-simulation LLM calls/tokens when LLM agents are used), action totals,
+  agents per type, and the `top_agents` (default 10, max 100) by reputation.
 - `WS   /ws` — WebSocket stream of orchestrator events (`round_complete`, …).
   With an API key set, authenticate with an `X-API-Key` header or by sending
   `{"command": "auth", "api_key": "..."}` as the first message
   (`?api_key=` in the URL still works but is deprecated: URLs end up in logs).
   Browser connections follow the same origin policy as REST
   (`SANDFISH_CORS_ORIGINS`, default loopback origins only).
+  A client receives events for every simulation until it sends
+  `{"command": "subscribe", "simulation_id": "..."}`; after that it receives
+  only the simulations it subscribed to (`unsubscribe` removes one, `subscribe`
+  without an id goes back to everything). Events are queued per client and
+  never hold up a simulation: a client that stops reading is disconnected
+  with close code 1013 once 256 messages are waiting for it.
 
 Failed authentication is throttled per client IP (default 10 per minute, then
 429 for that IP, including requests with the right key). Behind a reverse
