@@ -766,6 +766,50 @@ class SwarmOrchestrator:
             if aid in self.agents
         }
 
+    def agent_states(self, sim_id: str) -> Dict[str, Dict[str, Any]]:
+        """Per-agent state for a simulation, live or finished.
+
+        While a simulation can still run this reads the live agents; once it
+        has finished, the agents have been released and this returns the
+        snapshot taken at that moment. Raises KeyError for an unknown id.
+        """
+        return self._aggregate_final_state(self.simulations[sim_id])
+
+    def results_summary(self, sim_id: str, top_agents: int = 10) -> Dict[str, Any]:
+        """What a run produced: totals plus the ``top_agents`` highest-reputation
+        agents. Works for running and finished simulations alike."""
+        states = self.agent_states(sim_id)
+        ranked = sorted(
+            states.values(),
+            key=lambda s: s.get("state", {}).get("reputation", 0.0),
+            reverse=True,
+        )
+        type_counts: Dict[str, int] = {}
+        for s in states.values():
+            t = s.get("profile", {}).get("type", "?")
+            type_counts[t] = type_counts.get(t, 0) + 1
+        return {
+            "agent_types": type_counts,
+            "total_actions": sum(int(s.get("action_count", 0)) for s in states.values()),
+            "memory_targeted_actions": sum(
+                int(s.get("memory_targeted_actions", 0)) for s in states.values()
+            ),
+            "top_agents": [
+                {
+                    "id": s["id"],
+                    "name": s.get("profile", {}).get("name"),
+                    "type": s.get("profile", {}).get("type"),
+                    "reputation": round(s.get("state", {}).get("reputation", 0.0), 4),
+                    "energy": round(s.get("state", {}).get("energy", 0.0), 2),
+                    "mood": round(s.get("state", {}).get("mood", 0.0), 3),
+                    "following": len(s.get("state", {}).get("connections", [])),
+                    "posts": len(s.get("state", {}).get("posts_created", [])),
+                    "actions": s.get("action_count", 0),
+                }
+                for s in ranked[: max(0, int(top_agents))]
+            ],
+        }
+
     def _calculate_metrics(self, sim: Dict[str, Any]) -> Dict[str, float]:
         """Compute coarse simulation metrics."""
         config: SimulationConfig = sim["config"]

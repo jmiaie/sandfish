@@ -248,39 +248,11 @@ class SandfishMCP:
     def results(self, simulation_id: str, top_agents: int = 10) -> Dict[str, Any]:
         sim = self.sim(simulation_id)
         orch = self.orchestrator
-        states = orch._aggregate_final_state(sim)
-        agents = sorted(
-            states.values(),
-            key=lambda s: s.get("state", {}).get("reputation", 0.0),
-            reverse=True,
-        )
-        type_counts: Dict[str, int] = {}
-        for s in states.values():
-            t = s.get("profile", {}).get("type", "?")
-            type_counts[t] = type_counts.get(t, 0) + 1
         n = max(0, min(int(top_agents), MAX_REPORT_AGENTS))
         return {
             **self.status(simulation_id),
             "metrics": orch._calculate_metrics(sim),
-            "agent_types": type_counts,
-            "total_actions": sum(int(s.get("action_count", 0)) for s in states.values()),
-            "memory_targeted_actions": sum(
-                int(s.get("memory_targeted_actions", 0)) for s in states.values()
-            ),
-            "top_agents": [
-                {
-                    "id": s["id"],
-                    "name": s.get("profile", {}).get("name"),
-                    "type": s.get("profile", {}).get("type"),
-                    "reputation": round(s.get("state", {}).get("reputation", 0.0), 4),
-                    "energy": round(s.get("state", {}).get("energy", 0.0), 2),
-                    "mood": round(s.get("state", {}).get("mood", 0.0), 3),
-                    "following": len(s.get("state", {}).get("connections", [])),
-                    "posts": len(s.get("state", {}).get("posts_created", [])),
-                    "actions": s.get("action_count", 0),
-                }
-                for s in agents[:n]
-            ],
+            **orch.results_summary(simulation_id, n),
         }
 
     # ----- parameter search -----

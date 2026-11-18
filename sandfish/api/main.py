@@ -10,8 +10,8 @@ Endpoints:
 - POST /api/simulations/{id}/pause   request a pause
 - POST /api/simulations/{id}/resume  resume after a pause
 - POST /api/simulations/{id}/stop    request a stop
-- GET  /api/simulations/{id}/agents  list agent state
-- GET  /api/simulations/{id}/results latest results
+- GET  /api/simulations/{id}/agents  agent state (live, or the final snapshot)
+- GET  /api/simulations/{id}/results metrics, totals and the top agents
 - POST /api/security/audit           run the security auditor on the
                                      installed sandfish package (auth required)
 - WS   /ws                           real-time event stream
@@ -53,6 +53,7 @@ from fastapi import (
     Depends,
     FastAPI,
     HTTPException,
+    Query,
     Request,
     WebSocket,
     WebSocketDisconnect,
@@ -81,6 +82,11 @@ logger = logging.getLogger("sandfish.api")
 WS_AUTH_TIMEOUT_S = 10.0
 WS_MAX_PENDING_AUTH = 32
 _ws_pending_auth = 0
+# Messages that may wait in one WebSocket client's outbox. A client that falls
+# this far behind is disconnected (close code 1013) instead of being waited for.
+WS_OUTBOX_MAX = 256
+# Seconds allowed for the closing handshake with a client being disconnected.
+WS_CLOSE_TIMEOUT_S = 5.0
 
 
 def _utcnow_iso() -> str:
@@ -130,6 +136,11 @@ class SimulationResultResponse(BaseModel):
     start_time: str
     end_time: Optional[str] = None
     error_message: Optional[str] = None
+    # What the run produced (see SwarmOrchestrator.results_summary).
+    agent_types: Dict[str, int] = Field(default_factory=dict)
+    total_actions: int = 0
+    memory_targeted_actions: int = 0
+    top_agents: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class AgentInfoResponse(BaseModel):
@@ -140,13 +151,78 @@ class AgentInfoResponse(BaseModel):
     energy: float
     mood: float
     reputation: float
+    following: int = 0
+    posts: int = 0
+    actions: int = 0
 
 
 # ---------- Module-level state ----------
 
 
+class _EventClient:
+    """One WebSocket subscriber with its own bounded outbox.
+
+    Events used to be sent to every socket from inside the orchestrator's
+    event callback, which the run loop awaits. A client that stopped reading
+    made `send_json` wait, and every simulation waited with it. Now the
+    callback only queues the message; one task per client does the sending,
+    and it is the only writer on that socket. A client whose outbox fills up
+    is disconnected rather than waited for.
+    """
+
+    def __init__(self, websocket: WebSocket):
+        self.websocket = websocket
+        self.outbox: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue(maxsize=WS_OUTBOX_MAX)
+        # None: events for every simulation (the default). A set: only these.
+        self.subscriptions: Optional[set] = None
+        self._sender: Optional["asyncio.Task[None]"] = None
+        self._closer: Optional["asyncio.Task[None]"] = None
+
+    def start(self) -> None:
+        self._sender = asyncio.create_task(self._send_loop())
+
+    def wants(self, data: Any) -> bool:
+        if self.subscriptions is None:
+            return True
+        sim_id = data.get("simulation_id") if isinstance(data, dict) else None
+        return sim_id is None or sim_id in self.subscriptions
+
+    def offer(self, message: Dict[str, Any]) -> bool:
+        """Queue a message without waiting. False means the outbox is full."""
+        try:
+            self.outbox.put_nowait(message)
+        except asyncio.QueueFull:
+            return False
+        return True
+
+    async def _send_loop(self) -> None:
+        try:
+            while True:
+                await self.websocket.send_json(await self.outbox.get())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return  # socket is gone; the receive loop sees the disconnect
+
+    def drop(self) -> None:
+        """Disconnect a client that is not keeping up, without waiting on it."""
+        self.stop()
+        if self._closer is None:
+            self._closer = asyncio.create_task(self._close(status.WS_1013_TRY_AGAIN_LATER))
+
+    def stop(self) -> None:
+        if self._sender is not None:
+            self._sender.cancel()
+
+    async def _close(self, code: int) -> None:
+        try:
+            await asyncio.wait_for(self.websocket.close(code=code), timeout=WS_CLOSE_TIMEOUT_S)
+        except Exception:
+            pass  # already closed, or the peer never answered
+
+
 orchestrator: Optional[SwarmOrchestrator] = None
-_websocket_clients: List[WebSocket] = []
+_websocket_clients: List[_EventClient] = []
 _websocket_lock = asyncio.Lock()
 
 
@@ -364,12 +440,11 @@ async def lifespan(app: FastAPI):
         await asyncio.to_thread(orchestrator.close)
 
     async with _websocket_lock:
-        for ws in list(_websocket_clients):
-            try:
-                await ws.close()
-            except Exception:
-                pass
+        clients = list(_websocket_clients)
         _websocket_clients.clear()
+    for client in clients:
+        client.stop()
+        await client._close(status.WS_1001_GOING_AWAY)
 
 
 # ---------- App ----------
@@ -495,7 +570,11 @@ app.add_middleware(_DynamicCORS)
 
 
 async def _broadcast_event(event_type: str, data: Dict[str, Any]) -> None:
-    """Broadcast an event to all connected websocket clients."""
+    """Queue an event for every WebSocket client that wants it.
+
+    Registered as an orchestrator event callback, so it runs inside the
+    simulation's run loop and must never wait on a client.
+    """
     message = {
         "type": event_type,
         "timestamp": _utcnow_iso(),
@@ -505,18 +584,15 @@ async def _broadcast_event(event_type: str, data: Dict[str, Any]) -> None:
     async with _websocket_lock:
         clients = list(_websocket_clients)
 
-    dropped: List[WebSocket] = []
-    for ws in clients:
-        try:
-            await ws.send_json(message)
-        except Exception:
-            dropped.append(ws)
-
-    if dropped:
+    slow = [c for c in clients if c.wants(data) and not c.offer(message)]
+    if slow:
         async with _websocket_lock:
-            for ws in dropped:
-                if ws in _websocket_clients:
-                    _websocket_clients.remove(ws)
+            for client in slow:
+                if client in _websocket_clients:
+                    _websocket_clients.remove(client)
+        for client in slow:
+            logger.warning("Disconnecting a WebSocket client that stopped reading events")
+            client.drop()
 
 
 # ---------- Helpers ----------
@@ -737,27 +813,31 @@ async def stop_simulation(sim_id: str) -> Dict[str, str]:
     tags=["simulations"],
 )
 async def get_simulation_agents(sim_id: str) -> List[AgentInfoResponse]:
-    """List the agents in a simulation with their current state."""
+    """List the agents in a simulation with their state.
+
+    While the simulation can still run this is the live state. After it has
+    finished, the agents themselves are released and this returns the state
+    they ended in.
+    """
     orch = _require_orchestrator()
     if sim_id not in orch.simulations:
         raise HTTPException(status_code=404, detail="Simulation not found")
 
-    sim = orch.simulations[sim_id]
     agents: List[AgentInfoResponse] = []
-    for agent_id in sim["agents"]:
-        agent = orch.agents.get(agent_id)
-        if agent is None:
-            continue
-        snapshot = agent.get_state()
+    for agent_id, snapshot in orch.agent_states(sim_id).items():
+        state = snapshot["state"]
         agents.append(
             AgentInfoResponse(
-                id=agent.id,
+                id=snapshot.get("id", agent_id),
                 name=snapshot["profile"]["name"],
                 type=snapshot["profile"]["type"],
-                status=snapshot["state"]["status"],
-                energy=snapshot["state"]["energy"],
-                mood=snapshot["state"]["mood"],
-                reputation=snapshot["state"]["reputation"],
+                status=state["status"],
+                energy=state["energy"],
+                mood=state["mood"],
+                reputation=state["reputation"],
+                following=len(state.get("connections", [])),
+                posts=len(state.get("posts_created", [])),
+                actions=int(snapshot.get("action_count", 0)),
             )
         )
     return agents
@@ -769,8 +849,12 @@ async def get_simulation_agents(sim_id: str) -> List[AgentInfoResponse]:
     dependencies=[Depends(rate_limit)],
     tags=["simulations"],
 )
-async def get_simulation_results(sim_id: str) -> SimulationResultResponse:
-    """Return the latest result snapshot for a simulation."""
+async def get_simulation_results(
+    sim_id: str,
+    top_agents: int = Query(default=10, ge=0, le=100, description="Agents to list, by reputation"),
+) -> SimulationResultResponse:
+    """Return the latest result snapshot for a simulation: run metrics, action
+    totals and the highest-reputation agents. Available during and after a run."""
     orch = _require_orchestrator()
     if sim_id not in orch.simulations:
         raise HTTPException(status_code=404, detail="Simulation not found")
@@ -785,6 +869,7 @@ async def get_simulation_results(sim_id: str) -> SimulationResultResponse:
         start_time=(sim["start_time"] or datetime.now(timezone.utc)).isoformat(),
         end_time=sim["end_time"].isoformat() if sim["end_time"] else None,
         error_message=sim["error"],
+        **orch.results_summary(sim_id, top_agents),
     )
 
 
@@ -924,42 +1009,52 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             {"type": "authenticated", "timestamp": _utcnow_iso(), "data": {}}
         )
 
+    # From here on the sender task is the only writer on this socket: replies
+    # to commands go through the same outbox as events, in order.
+    client = _EventClient(websocket)
+    client.offer(
+        {
+            "type": "connected",
+            "timestamp": _utcnow_iso(),
+            "data": {"message": "Connected to SandFish"},
+        }
+    )
+    client.start()
     async with _websocket_lock:
-        _websocket_clients.append(websocket)
+        _websocket_clients.append(client)
+
+    def reply(kind: str, data: Optional[Dict[str, Any]] = None) -> bool:
+        message: Dict[str, Any] = {"type": kind, "timestamp": _utcnow_iso()}
+        if data is not None:
+            message["data"] = data
+        return client.offer(message)
 
     try:
-        await websocket.send_json(
-            {
-                "type": "connected",
-                "timestamp": _utcnow_iso(),
-                "data": {"message": "Connected to SandFish"},
-            }
-        )
-
         while True:
             message = await websocket.receive_json()
             command = message.get("command")
+            sim_id = message.get("simulation_id")
 
             if command == "subscribe":
-                await websocket.send_json(
-                    {
-                        "type": "subscribed",
-                        "timestamp": _utcnow_iso(),
-                        "data": {"simulation_id": message.get("simulation_id")},
-                    }
-                )
+                # No id (or "*"): every simulation, which is also the default.
+                # Otherwise only events for the ids subscribed so far.
+                if sim_id in (None, "*"):
+                    client.subscriptions = None
+                else:
+                    if client.subscriptions is None:
+                        client.subscriptions = set()
+                    client.subscriptions.add(str(sim_id))
+                ok = reply("subscribed", {"simulation_id": sim_id})
+            elif command == "unsubscribe":
+                if client.subscriptions is not None and sim_id is not None:
+                    client.subscriptions.discard(str(sim_id))
+                ok = reply("unsubscribed", {"simulation_id": sim_id})
             elif command == "ping":
-                await websocket.send_json(
-                    {"type": "pong", "timestamp": _utcnow_iso()}
-                )
+                ok = reply("pong")
             else:
-                await websocket.send_json(
-                    {
-                        "type": "error",
-                        "timestamp": _utcnow_iso(),
-                        "data": {"message": f"Unknown command: {command!r}"},
-                    }
-                )
+                ok = reply("error", {"message": f"Unknown command: {command!r}"})
+            if not ok:
+                break  # outbox full: the client is not reading
 
     except WebSocketDisconnect:
         pass
@@ -968,8 +1063,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         logger.debug("WebSocket client error: %s", exc)
     finally:
         async with _websocket_lock:
-            if websocket in _websocket_clients:
-                _websocket_clients.remove(websocket)
+            if client in _websocket_clients:
+                _websocket_clients.remove(client)
+        client.stop()
+        await client._close(status.WS_1000_NORMAL_CLOSURE)
 
 
 # ---------- Error handler ----------
