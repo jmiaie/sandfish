@@ -11,16 +11,16 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
-_PERIOD_RE = re.compile(r"[0-9]{8}T[0-9]{2}Z")
+_PERIOD_RE = re.compile(r"[0-9]{8}T[0-9]{2}Z?")
 _HOUR = timedelta(hours=1)
 
 
 def parse_eia_hour(period: str) -> datetime:
-    """Parse ``YYYYMMDDTHHZ`` into an aware UTC datetime."""
+    """Parse ``YYYYMMDDTHH`` (the bulk-file form) or ``YYYYMMDDTHHZ`` into an aware UTC datetime."""
     if not isinstance(period, str) or not _PERIOD_RE.fullmatch(period):
         raise ValueError(f"invalid EIA period: {period!r}")
     try:
-        return datetime.strptime(period, "%Y%m%dT%HZ").replace(tzinfo=timezone.utc)
+        return datetime.strptime(period.rstrip("Z"), "%Y%m%dT%H").replace(tzinfo=timezone.utc)
     except ValueError as exc:
         raise ValueError(f"invalid EIA period: {period!r}") from exc
 
