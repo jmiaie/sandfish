@@ -33,7 +33,9 @@ def _fixture():
 def test_parse_hour_ok_and_bad():
     dt = parse_eia_hour("20240310T09Z")
     assert dt.isoformat() == "2024-03-10T09:00:00+00:00"
-    for bad in ("2024-03-10T09Z", "20240310T24Z", "20240310T9Z", "", "20240310T09"):
+    # The real EBA.txt bulk file uses periods without the trailing Z (found by the live run).
+    assert parse_eia_hour("20240310T09") == dt
+    for bad in ("2024-03-10T09Z", "20240310T24Z", "20240310T9Z", "", "20240310T09ZZ", "20240310T"):
         with pytest.raises(ValueError):
             parse_eia_hour(bad)
 
@@ -170,3 +172,12 @@ def test_invalid_series_id_does_not_abort_scan():
     res = check_ba(lines)
     assert res["has_D"] and res["has_DF"]
     assert res["overlap_hours"] == 1
+
+
+def test_real_bulk_file_shape_newest_first_string_values():
+    # Shape seen in the live EBA.txt: no Z, newest first, numeric values as strings.
+    data = [["20261118T19", "30259.00000000000000"], ["20261118T18", "31017.0"], ["20261118T16", None]]
+    s = summarize_series(data)
+    assert s["count"] == 3 and s["bad_periods"] == 0
+    assert s["first"] == "2026-11-18T16:00:00+00:00" and s["last"] == "2026-11-18T19:00:00+00:00"
+    assert s["missing_hours"] == 1 and s["null_values"] == 1
