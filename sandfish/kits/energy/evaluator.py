@@ -15,6 +15,7 @@ _HOUR = timedelta(hours=1)
 _SEASONAL_LAG = 168
 _MODELS = ("seasonal_naive", "lag_mean", "lag_mean_temp")
 _NO_WEATHER = object()
+_NO_BIAS = object()
 
 
 def _clean(series: Mapping[datetime, float], label: str) -> Dict[datetime, float]:
@@ -74,6 +75,9 @@ class EnergyLoadEvaluator:
         tz: str = "America/Los_Angeles",
         weather: Optional[Mapping[datetime, float]] = None,
         weather_lead_days: int = 2,
+        bias_baseline: bool = False,
+        bias_window_days: int = 7,
+        bias_lag_days: int = 2,
     ) -> None:
         self._demand = _clean(demand, "demand")
         self._df = _clean(operator_forecast, "operator_forecast")
@@ -85,6 +89,25 @@ class EnergyLoadEvaluator:
         self.min_lag_hours = int(min_lag_hours)
         self.tz = tz
         self._zone = ZoneInfo(tz)
+        if not isinstance(bias_baseline, bool):
+            raise ValueError(f"bias_baseline must be a bool, got {bias_baseline!r}")
+        if bias_baseline:
+            for label, val, low in (
+                ("bias_window_days", bias_window_days, 1),
+                ("bias_lag_days", bias_lag_days, 2),
+            ):
+                if isinstance(val, bool) or not isinstance(val, int) or val < low:
+                    raise ValueError(f"{label} must be an int >= {low}, got {val!r}")
+            if bias_window_days > 365:
+                raise ValueError(f"bias_window_days must be <= 365, got {bias_window_days!r}")
+            if 24 * bias_lag_days < self.min_lag_hours:
+                raise ValueError(
+                    f"24 * bias_lag_days ({24 * bias_lag_days}) must be >= "
+                    f"min_lag_hours ({self.min_lag_hours})"
+                )
+        self.bias_baseline = bias_baseline
+        self.bias_window_days = bias_window_days
+        self.bias_lag_days = bias_lag_days
         self.weather_lead_days: Optional[int] = None
         self._weather: Optional[Dict[datetime, float]] = None
         if weather is not None:
@@ -151,7 +174,9 @@ class EnergyLoadEvaluator:
         mae_df: List[float] = []
         mae_sn: List[float] = []
         total = 0
+        mae_bc: List[float] = []
         no_wx = 0
+        no_bias = 0
         day = start
         while day <= end:
             total += 1
@@ -159,11 +184,15 @@ class EnergyLoadEvaluator:
             row = self._score_day(hours, lags, coef) if len(hours) == 24 else None
             if row is _NO_WEATHER:
                 no_wx += 1
+            elif row is _NO_BIAS:
+                no_bias += 1
             elif row is not None:
                 days.append(day.isoformat())
                 mae_model.append(row[0])
                 mae_df.append(row[1])
                 mae_sn.append(row[2])
+                if self.bias_baseline:
+                    mae_bc.append(row[3])
             day += timedelta(days=1)
 
         n = len(days)
@@ -179,6 +208,11 @@ class EnergyLoadEvaluator:
         }
         if model == "lag_mean_temp":
             meta["days_without_weather"] = no_wx
+        if self.bias_baseline:
+            s_bc = sum(mae_bc)
+            meta["skill_vs_bias_corrected_df"] = _skill(s_model, s_bc)
+            meta["skill_bias_corrected_df_vs_operator"] = _skill(s_bc, s_df)
+            meta["days_without_bias_baseline"] = no_bias
         if n < self.min_days:
             return EvaluationResult.not_scorable(
                 n=n, reason=f"only {n} usable days (min_days={self.min_days})", **meta
@@ -200,6 +234,18 @@ class EnergyLoadEvaluator:
             raise ValueError(f"temp_coef must be a finite number, got {c!r}")
         return float(c)
 
+    def _bias_forecast(self, t: datetime, op: float) -> Optional[float]:
+        """BCDF(t): DF(t) plus the mean of D - DF at t - 24*k hours, k >= lag_days."""
+        diffs: List[float] = []
+        for k in range(self.bias_lag_days, self.bias_lag_days + self.bias_window_days):
+            d = _lagged(self._demand, t, 24 * k)
+            f = _lagged(self._df, t, 24 * k)
+            if d is not None and f is not None:
+                diffs.append(d - f)
+        if len(diffs) < max(1, self.bias_window_days - 2):
+            return None
+        return op + sum(diffs) / len(diffs)
+
     def _score_day(
         self, hours: List[datetime], lags: List[int], coef: Optional[float] = None
     ) -> Any:
@@ -218,7 +264,8 @@ class EnergyLoadEvaluator:
                             f"lag {lag}h would leak demand at {t.isoformat()} "
                             f"(needs >= {floor}h) for lag_mean_temp"
                         )
-        err_m = err_d = err_s = 0.0
+        err_m = err_d = err_s = err_b = 0.0
+        bias_missing = False
         missing_wx = False
         wx = self._weather or {}
         for t in hours:
@@ -247,10 +294,20 @@ class EnergyLoadEvaluator:
             err_m += abs(actual / 24 - pred / 24)
             err_d += abs(actual / 24 - op / 24)
             err_s += abs(actual / 24 - sn / 24)
+            if self.bias_baseline:
+                bc = self._bias_forecast(t, op)
+                if bc is None or not math.isfinite(bc):
+                    bias_missing = True
+                else:
+                    err_b += abs(actual / 24 - bc / 24)
         if missing_wx:
             return _NO_WEATHER
         row = (err_m, err_d, err_s)
-        return row if all(math.isfinite(x) for x in row) else None
+        if not all(math.isfinite(x) for x in row):
+            return None
+        if self.bias_baseline:
+            return _NO_BIAS if bias_missing else (*row, err_b)
+        return row
 
 
 def split_summary(evaluator: EnergyLoadEvaluator) -> dict:
@@ -263,4 +320,9 @@ def split_summary(evaluator: EnergyLoadEvaluator) -> dict:
     }
     if evaluator.weather_lead_days is not None:
         out["weather_lead_days"] = evaluator.weather_lead_days
+    if evaluator.bias_baseline:
+        out["bias_baseline"] = {
+            "window_days": evaluator.bias_window_days,
+            "lag_days": evaluator.bias_lag_days,
+        }
     return out
