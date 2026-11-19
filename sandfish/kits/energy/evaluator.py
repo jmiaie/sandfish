@@ -7,11 +7,14 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 from zoneinfo import ZoneInfo
 
+from sandfish.kits.energy.availability import min_lag_hours
+from sandfish.kits.energy.weather import WeatherLeakError, assert_safe_lead, is_lead_usable
 from sandfish.search.evaluator import SPLITS, EvaluationResult
 
 _HOUR = timedelta(hours=1)
 _SEASONAL_LAG = 168
-_MODELS = ("seasonal_naive", "lag_mean")
+_MODELS = ("seasonal_naive", "lag_mean", "lag_mean_temp")
+_NO_WEATHER = object()
 
 
 def _clean(series: Mapping[datetime, float], label: str) -> Dict[datetime, float]:
@@ -69,6 +72,8 @@ class EnergyLoadEvaluator:
         min_days: int = 60,
         min_lag_hours: int = 39,
         tz: str = "America/Los_Angeles",
+        weather: Optional[Mapping[datetime, float]] = None,
+        weather_lead_days: int = 2,
     ) -> None:
         self._demand = _clean(demand, "demand")
         self._df = _clean(operator_forecast, "operator_forecast")
@@ -80,6 +85,14 @@ class EnergyLoadEvaluator:
         self.min_lag_hours = int(min_lag_hours)
         self.tz = tz
         self._zone = ZoneInfo(tz)
+        self.weather_lead_days: Optional[int] = None
+        self._weather: Optional[Dict[datetime, float]] = None
+        if weather is not None:
+            # Unsafe lead is an error whatever models are evaluated later.
+            self.weather_lead_days = assert_safe_lead(weather_lead_days, tz)
+            # Naive weather keys raise here, like every other series in this evaluator
+            # (_clean rejects naive keys); that is intended, not a weather-specific failure.
+            self._weather = _clean(weather, "weather")
 
     def _day_hours(self, day: date) -> List[datetime]:
         """UTC hour starts of a local delivery day (23/24/25 of them)."""
@@ -104,6 +117,8 @@ class EnergyLoadEvaluator:
         model = variant.get("model", "lag_mean")
         if model not in _MODELS:
             raise ValueError(f"model must be one of {_MODELS}, not {model!r}")
+        if model == "lag_mean_temp" and self._weather is None:
+            raise ValueError("lag_mean_temp requires weather")
         if model == "seasonal_naive":
             lags = [_SEASONAL_LAG]
         else:
@@ -117,6 +132,8 @@ class EnergyLoadEvaluator:
                 if isinstance(lag, bool) or not isinstance(lag, int) or lag <= 0:
                     raise ValueError(f"lags must be positive ints, got {lag!r}")
                 lags.append(lag)
+        # Leak guard: demand lags must be >= min_lag_hours. A custom lag shorter than that
+        # is rejected even with weather; weather never relaxes the demand guard.
         for lag in lags:
             if lag < self.min_lag_hours:
                 raise ValueError(f"lag {lag}h would leak (min_lag_hours={self.min_lag_hours})")
@@ -126,6 +143,7 @@ class EnergyLoadEvaluator:
         if split not in SPLITS:
             raise ValueError(f"split must be one of {SPLITS}, not {split!r}")
         model, lags = self._lags(variant)
+        coef = self._temp_coef(variant) if model == "lag_mean_temp" else None
         start, end = self.train_days if split == "train" else self.test_days
 
         days: List[str] = []
@@ -133,12 +151,15 @@ class EnergyLoadEvaluator:
         mae_df: List[float] = []
         mae_sn: List[float] = []
         total = 0
+        no_wx = 0
         day = start
         while day <= end:
             total += 1
             hours = self._day_hours(day)
-            row = self._score_day(hours, lags) if len(hours) == 24 else None
-            if row is not None:
+            row = self._score_day(hours, lags, coef) if len(hours) == 24 else None
+            if row is _NO_WEATHER:
+                no_wx += 1
+            elif row is not None:
                 days.append(day.isoformat())
                 mae_model.append(row[0])
                 mae_df.append(row[1])
@@ -156,6 +177,8 @@ class EnergyLoadEvaluator:
             "split": split,
             "model": model,
         }
+        if model == "lag_mean_temp":
+            meta["days_without_weather"] = no_wx
         if n < self.min_days:
             return EvaluationResult.not_scorable(
                 n=n, reason=f"only {n} usable days (min_days={self.min_days})", **meta
@@ -170,10 +193,34 @@ class EnergyLoadEvaluator:
             )
         return EvaluationResult(score=1 - s_model / s_df, n=n, metadata=meta)
 
+    @staticmethod
+    def _temp_coef(variant: Mapping[str, Any]) -> float:
+        c = variant.get("temp_coef", 0.0)
+        if isinstance(c, bool) or not isinstance(c, (int, float)) or not math.isfinite(c):
+            raise ValueError(f"temp_coef must be a finite number, got {c!r}")
+        return float(c)
+
     def _score_day(
-        self, hours: List[datetime], lags: List[int]
-    ) -> Optional[Tuple[float, float, float]]:
+        self, hours: List[datetime], lags: List[int], coef: Optional[float] = None
+    ) -> Any:
+        if coef is not None:
+            # Runtime guards, per scored target hour (the constructor scan covers only a
+            # fixed date range, so it cannot vouch for every delivery date or tz).
+            for t in hours:
+                if not is_lead_usable(t, self.weather_lead_days or 0, self.tz):
+                    raise WeatherLeakError(
+                        f"weather lead {self.weather_lead_days}d is not usable at {t.isoformat()}"
+                    )
+                floor = min_lag_hours(t, self.tz)
+                for lag in lags:
+                    if lag < floor:
+                        raise ValueError(
+                            f"lag {lag}h would leak demand at {t.isoformat()} "
+                            f"(needs >= {floor}h) for lag_mean_temp"
+                        )
         err_m = err_d = err_s = 0.0
+        missing_wx = False
+        wx = self._weather or {}
         for t in hours:
             actual = _get(self._demand, t)
             op = _get(self._df, t)
@@ -187,18 +234,33 @@ class EnergyLoadEvaluator:
                     return None
                 vals.append(v)
             pred = sum(v / len(vals) for v in vals)
+            if coef is not None:
+                # Lagged weather W[t-lag] is allowed: it is a lead-k forecast for an earlier
+                # valid hour, issued even earlier than W[t] (< cutoff), so it leaks nothing.
+                w_now = _get(wx, t)
+                w_lags = [_lagged(wx, t, lag) for lag in lags]
+                if w_now is None or any(w is None for w in w_lags):
+                    missing_wx = True
+                else:
+                    w_mean = sum(w / len(w_lags) for w in w_lags if w is not None)
+                    pred += coef * (w_now - w_mean)
             err_m += abs(actual / 24 - pred / 24)
             err_d += abs(actual / 24 - op / 24)
             err_s += abs(actual / 24 - sn / 24)
+        if missing_wx:
+            return _NO_WEATHER
         row = (err_m, err_d, err_s)
         return row if all(math.isfinite(x) for x in row) else None
 
 
 def split_summary(evaluator: EnergyLoadEvaluator) -> dict:
     """Return the evaluator's split ranges and guard settings."""
-    return {
+    out: Dict[str, Any] = {
         "train": [d.isoformat() for d in evaluator.train_days],
         "test": [d.isoformat() for d in evaluator.test_days],
         "min_days": evaluator.min_days,
         "min_lag_hours": evaluator.min_lag_hours,
     }
+    if evaluator.weather_lead_days is not None:
+        out["weather_lead_days"] = evaluator.weather_lead_days
+    return out
