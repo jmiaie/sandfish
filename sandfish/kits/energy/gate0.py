@@ -156,7 +156,7 @@ def check_ba(lines: Iterable[str], ba: str = "CISO") -> dict:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    """CLI entry point; returns 0 when both D and DF series are present."""
+    """CLI entry point; returns 0 when D and DF exist and share at least one usable hour."""
     parser = argparse.ArgumentParser(description="EIA-930 Gate 0 data check")
     parser.add_argument("path", help="EBA.txt path, or - for stdin")
     parser.add_argument("--ba", default="CISO")
@@ -167,7 +167,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         with open(args.path, encoding="utf-8") as fh:
             result = check_ba(fh, args.ba)
     print(json.dumps(result, indent=2))
-    return 0 if result["has_D"] and result["has_DF"] else 1
+    if not (result["has_D"] and result["has_DF"]):
+        return 1
+    if result["overlap_hours"] <= 0:
+        # Both series exist but no hour has a usable demand value and forecast (for example
+        # every period failed to parse): that must not look like success.
+        print("gate0: no usable overlapping D/DF hours", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
