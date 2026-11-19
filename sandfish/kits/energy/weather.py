@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
-from typing import Any, Dict, Mapping, Set
+from typing import Any, Dict, List, Mapping, Set
 from zoneinfo import ZoneInfo
 
 TZ = "America/Los_Angeles"
@@ -80,7 +80,7 @@ def _proves_utc(payload: Mapping[str, Any]) -> bool:
     if isinstance(off, bool) or not isinstance(off, (int, float)) or off != 0:
         return False
     zone = payload.get("timezone")
-    return isinstance(zone, str) and zone.strip().lower() in _UTC_NAMES
+    return isinstance(zone, str) and zone.lower() in _UTC_NAMES
 
 
 def parse_previous_runs(
@@ -128,14 +128,21 @@ def parse_previous_runs(
 
 
 def merge_weather(*maps: Mapping[datetime, float]) -> Dict[datetime, float]:
-    """Merge parsed maps; an hour present twice must agree within 1e-9."""
-    out: Dict[datetime, float] = {}
+    """Merge parsed maps; every value at an hour must agree within 1e-9 (order-independent).
+
+    When values differ by less than the tolerance the smallest is kept, so the result does
+    not depend on the order of ``maps``.
+    """
+    seen: Dict[datetime, List[float]] = {}
     for m in maps:
         for key, val in m.items():
-            k = _aware_utc(key, "weather key")
-            if k in out and not abs(out[k] - val) <= 1e-9:
-                raise ValueError(f"conflicting values at {k.isoformat()}: {out[k]} vs {val}")
-            out.setdefault(k, val)
+            seen.setdefault(_aware_utc(key, "weather key"), []).append(val)
+    out: Dict[datetime, float] = {}
+    for k, vals in seen.items():
+        lo, hi = min(vals), max(vals)
+        if not hi - lo <= 1e-9:
+            raise ValueError(f"conflicting values at {k.isoformat()}: {lo} vs {hi}")
+        out[k] = lo
     return out
 
 

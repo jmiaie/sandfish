@@ -1,5 +1,6 @@
 """Tests for kit 1 stage 2: weather features and the lag_mean_temp model."""
 
+import itertools
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -319,3 +320,25 @@ def test_naive_weather_keys_raise_at_construction():
     d, o, _ = series(24 * 10)
     with pytest.raises(ValueError):
         EnergyLoadEvaluator(d, o, TRAIN, TEST, weather={datetime(2024, 4, 1): 15.0})
+
+
+@pytest.mark.parametrize("order", list(itertools.permutations([0.0, 9e-10, -9e-10])))
+def test_merge_weather_is_order_independent(order):
+    t = datetime(2024, 1, 1, tzinfo=UTC)
+    # 9e-10 and -9e-10 differ by 1.8e-9 > 1e-9, so every order must raise.
+    with pytest.raises(ValueError) as exc:
+        merge_weather(*({t: v} for v in order))
+    assert "2024-01-01" in str(exc.value)
+
+
+def test_merge_weather_within_tolerance_is_order_independent():
+    t = datetime(2024, 1, 1, tzinfo=UTC)
+    vals = [1.0, 1.0 + 4e-10, 1.0 - 4e-10]
+    results = {merge_weather(*({t: v} for v in order))[t] for order in itertools.permutations(vals)}
+    assert len(results) == 1
+
+
+@pytest.mark.parametrize("zone", [" GMT ", "GMT ", " UTC", "\tUTC\n", " Etc/UTC "])
+def test_utc_proof_rejects_surrounding_whitespace(zone):
+    with pytest.raises(ValueError):
+        parse_previous_runs(payload(timezone=zone))
