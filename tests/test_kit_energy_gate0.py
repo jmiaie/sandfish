@@ -176,8 +176,34 @@ def test_invalid_series_id_does_not_abort_scan():
 
 def test_real_bulk_file_shape_newest_first_string_values():
     # Shape seen in the live EBA.txt: no Z, newest first, numeric values as strings.
-    data = [["20261118T19", "30259.00000000000000"], ["20261118T18", "31017.0"], ["20261118T16", None]]
+    data = [
+        ["20261118T19", "30259.00000000000000"],
+        ["20261118T18", "31017.0"],
+        ["20261118T16", None],
+    ]
     s = summarize_series(data)
     assert s["count"] == 3 and s["bad_periods"] == 0
     assert s["first"] == "2026-11-18T16:00:00+00:00" and s["last"] == "2026-11-18T19:00:00+00:00"
     assert s["missing_hours"] == 1 and s["null_values"] == 1
+
+
+def test_cli_nonzero_when_series_exist_but_no_usable_hours(tmp_path, capsys):
+    # Both series present but every period is unparseable: zero usable hours must fail.
+    bad = tmp_path / "bad_periods.txt"
+    bad.write_text(
+        _line(D_ID, [["2024-01-01T00", 5]]) + "\n" + _line(DF_ID, [["2024-01-01T00", 6]]),
+        encoding="utf-8",
+    )
+    assert main([str(bad)]) == 1
+    out = capsys.readouterr()
+    assert '"overlap_hours": 0' in out.out
+    assert "no usable" in out.err
+
+
+def test_cli_nonzero_when_no_overlap(tmp_path):
+    p = tmp_path / "no_overlap.txt"
+    p.write_text(
+        _line(D_ID, [["20240101T00Z", 5]]) + "\n" + _line(DF_ID, [["20240102T00Z", 6]]),
+        encoding="utf-8",
+    )
+    assert main([str(p)]) == 1
