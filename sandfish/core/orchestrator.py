@@ -153,9 +153,15 @@ class SwarmOrchestrator:
         memory_adapter: OMPAMemoryAdapter,
         checkpoint_dir: Optional[Path] = None,
         limits: Optional[SimulationLimits] = None,
+        keep_checkpoints: Optional[int] = 5,
     ):
         self.memory = memory_adapter
         self.limits = limits or SimulationLimits()
+        # How many of a simulation's newest checkpoints stay in memory
+        # (None keeps them all). `checkpoint_dir` is unaffected.
+        if keep_checkpoints is not None and keep_checkpoints < 1:
+            raise ValueError("keep_checkpoints must be at least 1, or None for no limit")
+        self.keep_checkpoints = keep_checkpoints
         # One worker for blocking storage I/O (vault flushes, checkpoint
         # files): keeps it off the event loop, serialises writes, and bounds
         # the per-thread SQLite connections OMPA opens to one extra thread.
@@ -242,6 +248,7 @@ class SwarmOrchestrator:
             "start_time": None,
             "end_time": None,
             "checkpoints": [],
+            "checkpoint_count": 0,
             "error": None,
             # Snapshot taken when agents are released; see _release_agents.
             "final_state": None,
@@ -578,7 +585,15 @@ class SwarmOrchestrator:
                 if aid in self.agents
             },
         }
-        sim["checkpoints"].append(checkpoint)
+        # Only the newest few stay in memory: each one is a copy of every
+        # agent's state, nothing reads the older ones, and a long run would
+        # otherwise grow by one copy per interval. `checkpoint_dir` keeps
+        # them all on disk.
+        kept = sim["checkpoints"]
+        kept.append(checkpoint)
+        if self.keep_checkpoints is not None and len(kept) > self.keep_checkpoints:
+            del kept[: len(kept) - self.keep_checkpoints]
+        sim["checkpoint_count"] += 1
         sim["last_checkpoint_round"] = rounds_completed
 
         if self.checkpoint_dir is not None:
@@ -766,6 +781,50 @@ class SwarmOrchestrator:
             if aid in self.agents
         }
 
+    def agent_states(self, sim_id: str) -> Dict[str, Dict[str, Any]]:
+        """Per-agent state for a simulation, live or finished.
+
+        While a simulation can still run this reads the live agents; once it
+        has finished, the agents have been released and this returns the
+        snapshot taken at that moment. Raises KeyError for an unknown id.
+        """
+        return self._aggregate_final_state(self.simulations[sim_id])
+
+    def results_summary(self, sim_id: str, top_agents: int = 10) -> Dict[str, Any]:
+        """What a run produced: totals plus the ``top_agents`` highest-reputation
+        agents. Works for running and finished simulations alike."""
+        states = self.agent_states(sim_id)
+        ranked = sorted(
+            states.values(),
+            key=lambda s: s.get("state", {}).get("reputation", 0.0),
+            reverse=True,
+        )
+        type_counts: Dict[str, int] = {}
+        for s in states.values():
+            t = s.get("profile", {}).get("type", "?")
+            type_counts[t] = type_counts.get(t, 0) + 1
+        return {
+            "agent_types": type_counts,
+            "total_actions": sum(int(s.get("action_count", 0)) for s in states.values()),
+            "memory_targeted_actions": sum(
+                int(s.get("memory_targeted_actions", 0)) for s in states.values()
+            ),
+            "top_agents": [
+                {
+                    "id": s["id"],
+                    "name": s.get("profile", {}).get("name"),
+                    "type": s.get("profile", {}).get("type"),
+                    "reputation": round(s.get("state", {}).get("reputation", 0.0), 4),
+                    "energy": round(s.get("state", {}).get("energy", 0.0), 2),
+                    "mood": round(s.get("state", {}).get("mood", 0.0), 3),
+                    "following": len(s.get("state", {}).get("connections", [])),
+                    "posts": len(s.get("state", {}).get("posts_created", [])),
+                    "actions": s.get("action_count", 0),
+                }
+                for s in ranked[: max(0, int(top_agents))]
+            ],
+        }
+
     def _calculate_metrics(self, sim: Dict[str, Any]) -> Dict[str, float]:
         """Compute coarse simulation metrics."""
         config: SimulationConfig = sim["config"]
@@ -773,7 +832,7 @@ class SwarmOrchestrator:
         metrics = {
             "completion_rate": min(1.0, self._rounds_completed(sim) / max_rounds),
             "agent_count": float(len(sim["agents"])),
-            "checkpoint_count": float(len(sim["checkpoints"])),
+            "checkpoint_count": float(sim["checkpoint_count"]),
         }
         budget = sim.get("context", {}).get("llm_budget")
         if budget is not None:

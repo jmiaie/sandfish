@@ -9,10 +9,8 @@ services:
       - "8000:8000"
     volumes:
       - ./vault:/app/vault
-      - ./logs:/app/logs
     environment:
-      OMPA_VAULT_PATH: /app/vault
-      SANDFISH_ENV: production
+      SANDFISH_VAULT_PATH: /app/vault
       # Required: the container binds 0.0.0.0, and `sandfish api` refuses a
       # non-loopback bind without a key. Set it in your shell or .env file:
       #   SANDFISH_API_KEY=$(openssl rand -hex 32) docker compose up
@@ -40,15 +38,8 @@ services:
     command: ["sandfish", "orchestrator", "--vault", "/app/vault", "--rounds", "1000"]
     volumes:
       - ./vault:/app/vault
-      - ./logs:/app/logs
     environment:
-      OMPA_VAULT_PATH: /app/vault
+      SANDFISH_VAULT_PATH: /app/vault
     profiles:
       - orchestrator
     restart: "no"
-
-volumes:
-  vault:
-    driver: local
-  logs:
-    driver: local

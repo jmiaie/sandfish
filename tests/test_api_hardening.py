@@ -110,19 +110,57 @@ def test_cli_api_defaults_to_loopback_and_refuses_public_bind(monkeypatch, capsy
 # ----- auth -----
 
 
+SHORT_KEY = "short-key"  # placeholder; under MIN_STRONG_KEY_CHARS on purpose
+
+
 def test_failed_auth_is_rate_limited_per_ip(make_client, monkeypatch):
     _fresh_limiters(monkeypatch, auth_failures=3)
     with make_client(KEY) as c:
         codes = [c.get("/api/simulations", headers={"X-API-Key": f"wrong-{i}"}).status_code
                  for i in range(5)]
         assert codes == [401, 401, 401, 429, 429]
-        # Locked out IP can't use the right key until the window passes...
-        assert c.get("/api/simulations", headers={"X-API-Key": KEY}).status_code == 429
-    # ...and successful requests never count as failures.
+    # Successful requests never count as failures.
     _fresh_limiters(monkeypatch, auth_failures=3)
     with make_client(KEY) as c:
         for _ in range(5):
             assert c.get("/api/simulations", headers={"X-API-Key": KEY}).status_code == 200
+
+
+def test_wrong_keys_do_not_lock_out_the_right_key(make_client, monkeypatch):
+    """Behind a NAT or a reverse proxy every client has the same address, so
+    one client's wrong keys must not shut out the others."""
+    _fresh_limiters(monkeypatch, auth_failures=3)
+    with make_client(KEY) as c:
+        for i in range(6):
+            c.get("/api/simulations", headers={"X-API-Key": f"wrong-{i}"})
+        assert c.get("/api/simulations", headers={"X-API-Key": "wrong"}).status_code == 429
+        for _ in range(3):
+            assert c.get("/api/simulations", headers={"X-API-Key": KEY}).status_code == 200
+        # The address is still over budget for wrong keys.
+        assert c.get("/api/simulations", headers={"X-API-Key": "wrong"}).status_code == 429
+        with c.websocket_connect("/ws", headers={"X-API-Key": KEY}) as ws:
+            assert ws.receive_json()["type"] == "connected"
+
+
+def test_a_short_key_still_locks_out_an_address_over_budget(make_client, monkeypatch, caplog):
+    """A key short enough to guess is only protected by the limit on tries,
+    and letting the right key through would remove that limit."""
+    assert api.api_key_is_guessable(SHORT_KEY) and not api.api_key_is_guessable(KEY)
+    assert not api.api_key_is_guessable("k" * api.MIN_STRONG_KEY_CHARS)
+    _fresh_limiters(monkeypatch, auth_failures=3)
+    with caplog.at_level(logging.WARNING, logger="sandfish.api"), make_client(SHORT_KEY) as c:
+        assert c.get("/api/simulations", headers={"X-API-Key": SHORT_KEY}).status_code == 200
+        codes = [c.get("/api/simulations", headers={"X-API-Key": f"wrong-{i}"}).status_code
+                 for i in range(4)]
+        assert codes == [401, 401, 401, 429]
+        assert c.get("/api/simulations", headers={"X-API-Key": SHORT_KEY}).status_code == 429
+    assert any("shorter than" in r.getMessage() for r in caplog.records)
+
+
+def test_a_strong_key_starts_without_the_short_key_warning(make_client, caplog):
+    with caplog.at_level(logging.WARNING, logger="sandfish.api"), make_client(KEY) as c:
+        assert c.get("/health").status_code == 200
+    assert not any("shorter than" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.parametrize("bad", ["ключ".encode("utf-8"), "clé-ü".encode("latin-1"), b"\xff\xfe"])
@@ -392,7 +430,10 @@ def test_ws_failed_first_messages_count_toward_lockout(make_client, monkeypatch)
                 ws.send_json({"command": "ping"})
                 with pytest.raises(WebSocketDisconnect):
                     ws.receive_json()
-        assert c.get("/api/simulations", headers={"X-API-Key": KEY}).status_code == 429
+        # Two failures used the budget: a wrong key is now refused with 429...
+        assert c.get("/api/simulations", headers={"X-API-Key": "wrong"}).status_code == 429
+        # ...and the right key still works.
+        assert c.get("/api/simulations", headers={"X-API-Key": KEY}).status_code == 200
 
 
 @pytest.mark.asyncio

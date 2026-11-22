@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from datetime import date as _date
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Deque, Dict, Iterable, List, Optional
+from typing import Any, Deque, Dict, Iterable, List, Mapping, Optional
 
 logger = logging.getLogger("sandfish.memory")
 
@@ -81,6 +81,43 @@ def _valid_date(value: Optional[str]) -> Optional[str]:
         except ValueError:
             pass
     raise ValueError(f"date must be 'YYYY-MM-DD', got {value!r}")
+
+
+DEFAULT_VAULT_PATH = "./sandfish_vault"
+_warned_ompa_vault_path = False
+
+
+def default_vault_path(
+    env: Optional[Mapping[str, str]] = None, *, legacy_fallback: bool = False
+) -> str:
+    """The vault Sandfish uses when no path is given.
+
+    ``$SANDFISH_VAULT_PATH``, else ``./sandfish_vault``.
+
+    ``legacy_fallback`` keeps the old behaviour of the API and MCP server,
+    which read ``$OMPA_VAULT_PATH`` when nothing else was set. That is the
+    variable OMPA's own MCP server reads to find an agent's real memory, so
+    with it set for both programs, simulation notes are written into that
+    memory. The fallback still works, so nobody's vault moves, and it warns
+    once per process.
+    """
+    global _warned_ompa_vault_path
+    env = os.environ if env is None else env
+    own = (env.get("SANDFISH_VAULT_PATH") or "").strip()
+    if own:
+        return own
+    shared = (env.get("OMPA_VAULT_PATH") or "").strip()
+    if legacy_fallback and shared:
+        if not _warned_ompa_vault_path:
+            _warned_ompa_vault_path = True
+            logger.warning(
+                "Using OMPA_VAULT_PATH (%s) as the Sandfish vault. OMPA's MCP server "
+                "reads the same variable, so simulation notes will be written into "
+                "that vault. Set SANDFISH_VAULT_PATH to give Sandfish its own.",
+                shared,
+            )
+        return shared
+    return DEFAULT_VAULT_PATH
 
 
 def _env_flag(name: str, default: bool) -> bool:

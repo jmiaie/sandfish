@@ -61,7 +61,7 @@ from .core.orchestrator import (
     SimulationStatus,
     SwarmOrchestrator,
 )
-from .memory.ompa_adapter import OMPAMemoryAdapter
+from .memory.ompa_adapter import OMPAMemoryAdapter, default_vault_path
 from .search import (
     TrialLedger,
     attach_search,
@@ -253,39 +253,11 @@ class SandfishMCP:
     def results(self, simulation_id: str, top_agents: int = 10) -> Dict[str, Any]:
         sim = self.sim(simulation_id)
         orch = self.orchestrator
-        states = orch._aggregate_final_state(sim)
-        agents = sorted(
-            states.values(),
-            key=lambda s: s.get("state", {}).get("reputation", 0.0),
-            reverse=True,
-        )
-        type_counts: Dict[str, int] = {}
-        for s in states.values():
-            t = s.get("profile", {}).get("type", "?")
-            type_counts[t] = type_counts.get(t, 0) + 1
         n = max(0, min(int(top_agents), MAX_REPORT_AGENTS))
         return {
             **self.status(simulation_id),
             "metrics": orch._calculate_metrics(sim),
-            "agent_types": type_counts,
-            "total_actions": sum(int(s.get("action_count", 0)) for s in states.values()),
-            "memory_targeted_actions": sum(
-                int(s.get("memory_targeted_actions", 0)) for s in states.values()
-            ),
-            "top_agents": [
-                {
-                    "id": s["id"],
-                    "name": s.get("profile", {}).get("name"),
-                    "type": s.get("profile", {}).get("type"),
-                    "reputation": round(s.get("state", {}).get("reputation", 0.0), 4),
-                    "energy": round(s.get("state", {}).get("energy", 0.0), 2),
-                    "mood": round(s.get("state", {}).get("mood", 0.0), 3),
-                    "following": len(s.get("state", {}).get("connections", [])),
-                    "posts": len(s.get("state", {}).get("posts_created", [])),
-                    "actions": s.get("action_count", 0),
-                }
-                for s in agents[:n]
-            ],
+            **orch.results_summary(simulation_id, n),
         }
 
     # ----- parameter search -----
@@ -409,9 +381,7 @@ def build_server(
     enable_semantic: Optional[bool] = None,
 ) -> MCPServer:
     """Build the MCP server. ``server.sandfish`` exposes the state for tests."""
-    vault = vault_path or os.environ.get("SANDFISH_VAULT_PATH") or os.environ.get(
-        "OMPA_VAULT_PATH", "./sandfish_vault"
-    )
+    vault = vault_path or default_vault_path(legacy_fallback=True)
     app = SandfishMCP(vault, limits=limits, enable_semantic=enable_semantic)
     server = MCPServer(
         name="sandfish",
@@ -424,7 +394,8 @@ def build_server(
         name="sf_create_simulation",
         description=(
             "Create a simulation (not started). agent_types cycles over the agents; "
-            "known types: default, influencer, lurker (and llm when enabled). "
+            "known types: default, influencer, lurker, and llm when the operator "
+            "started this server with SANDFISH_SERVER_LLM_AGENTS=1. "
             "start_date (YYYY-MM-DD) dates memory writes in simulated time; "
             "seed makes runs reproducible."
         ),
@@ -901,7 +872,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--vault",
         default=None,
-        help="OMPA vault directory (default: $SANDFISH_VAULT_PATH, $OMPA_VAULT_PATH or ./sandfish_vault)",
+        help="OMPA vault directory (default: $SANDFISH_VAULT_PATH, else ./sandfish_vault)",
     )
     parser.add_argument("--version", action="version", version=f"sandfish-mcp {__version__}")
     args = parser.parse_args(argv)
@@ -911,6 +882,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         stream=sys.stderr,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # Off unless the operator set SANDFISH_SERVER_LLM_AGENTS.
+    from .llm.agent import enable_llm_agents_from_env
+    from .llm.base import LLMError
+
+    try:
+        enable_llm_agents_from_env()
+    except LLMError as exc:
+        print(f"sandfish-mcp: {exc}", file=sys.stderr)
+        return 2
     server = build_server(args.vault)
     try:
         server.run("stdio")

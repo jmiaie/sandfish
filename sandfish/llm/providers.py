@@ -21,7 +21,7 @@ import json
 import os
 from typing import Any, Dict, Optional
 
-from .base import LLMBudget, LLMBudgetExhausted, LLMError, record_usage, redact
+from .base import LLMBudget, LLMBudgetExhausted, LLMError, record_usage, redact, usage_sink
 
 DEFAULT_MODELS = {
     "anthropic": "claude-sonnet-5-5",
@@ -68,6 +68,8 @@ class _HTTPClient:
         self.budget = budget
         self._sem = asyncio.Semaphore(max(1, max_concurrency))
         self._transport = transport  # httpx.MockTransport in tests
+        self._client: Any = None
+        self._client_loop: Any = None
         self.max_retries = max(0, int(max_retries))
         if base_url:
             self.base_url = base_url
@@ -75,26 +77,77 @@ class _HTTPClient:
     def __repr__(self) -> str:  # never include the key
         return f"{type(self).__name__}(model={self.model!r})"
 
+    def _http(self) -> Any:
+        """The connection pool for this client, opened on first use.
+
+        One pool for the life of the client, so a run of many calls reuses
+        connections; it used to open a new one, with a new TLS handshake, for
+        every request. A pool belongs to the event loop it was opened on, and
+        each ``asyncio.run`` is a new loop, so it is reopened when the loop
+        changes.
+        """
+        loop = asyncio.get_running_loop()
+        if self._client is None or self._client_loop is not loop:
+            httpx = _import_httpx()
+            self._client = httpx.AsyncClient(timeout=self.timeout, transport=self._transport)
+            self._client_loop = loop
+        return self._client
+
+    async def aclose(self) -> None:
+        """Close the connection pool. Safe to call more than once."""
+        client, self._client, self._client_loop = self._client, None, None
+        if client is not None:
+            try:
+                await client.aclose()
+            except RuntimeError:  # its loop is gone, and its sockets with it
+                pass
+
+    def _charge_retry(self) -> bool:
+        """Take one more unit from every budget this call counts against: the
+        client's own and the calling simulation's. All or nothing."""
+        budgets = []
+        for budget in (self.budget, usage_sink.get()):
+            if budget is not None and not any(budget is b for b in budgets):
+                budgets.append(budget)
+        taken = []
+        for budget in budgets:
+            if not budget.try_acquire():
+                for b in taken:
+                    b.release()
+                return False
+            taken.append(budget)
+        return True
+
     async def _post(self, url: str, headers: Dict[str, str], body: Dict[str, Any]) -> Dict[str, Any]:
-        httpx = _import_httpx()
+        """POST with retries. Budgets count requests sent, not calls made: a
+        retry is another request the provider may bill, so it takes another
+        unit, and a call that runs out of budget mid-retry stops there."""
         if self.budget is not None and not self.budget.try_acquire():
             raise LLMBudgetExhausted("LLM call budget exhausted")
         resp = None
+        failure: Optional[str] = None
         async with self._sem:
             for attempt in range(self.max_retries + 1):
+                if attempt and not self._charge_retry():
+                    break  # out of budget: report the failure we already have
+                failure = None
                 try:
-                    async with httpx.AsyncClient(timeout=self.timeout, transport=self._transport) as client:
-                        resp = await client.post(url, headers=headers, json=body)
+                    resp = await self._http().post(url, headers=headers, json=body)
                 except Exception as exc:
+                    resp = None
+                    failure = redact(
+                        f"{self.name} request failed: {type(exc).__name__}: {exc}", self._api_key
+                    )
                     if attempt < self.max_retries:
                         await asyncio.sleep(0.5 * 2 ** attempt)
                         continue
-                    raise LLMError(redact(f"{self.name} request failed: {type(exc).__name__}: {exc}", self._api_key)) from None
+                    break
                 if resp.status_code in (429, 500, 502, 503, 504) and attempt < self.max_retries:
                     await asyncio.sleep(0.5 * 2 ** attempt)
                     continue
                 break
-        assert resp is not None
+        if resp is None:
+            raise LLMError(failure or f"{self.name} request failed") from None
         if resp.status_code >= 400:
             raise LLMError(redact(f"{self.name} HTTP {resp.status_code}: {resp.text[:300]}", self._api_key))
         try:
