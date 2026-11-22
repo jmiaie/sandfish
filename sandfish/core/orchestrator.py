@@ -824,6 +824,10 @@ class SwarmOrchestrator:
             metrics["llm_calls"] = float(budget.calls)
             metrics["llm_input_tokens"] = float(budget.input_tokens)
             metrics["llm_output_tokens"] = float(budget.output_tokens)
+        # Opt-in parameter search (sandfish.search) adds its trial counts.
+        search = sim.get("context", {}).get("search")
+        if search is not None and callable(getattr(search, "metrics", None)):
+            metrics.update(search.metrics())
         return metrics
 
 

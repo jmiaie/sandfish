@@ -28,6 +28,10 @@ For AegisFlow (stricter sandbox, lead/sub-agent delegation), see
 - Sync or async event callbacks for downstream dashboards.
 - FastAPI HTTP server with optional API-key auth, per-client rate limiting,
   and an event-stream endpoint.
+- Opt-in parameter search: researcher agents propose variants, an external
+  evaluator plugin scores them, and an append-only, hash-chained trial ledger
+  counts every evaluation (off by default; see
+  [Parameter search](#parameter-search-opt-in)).
 - Basic static security auditor over the source tree.
 - Docker image and Compose stack for the API and a standalone orchestrator.
 
@@ -161,6 +165,7 @@ Environment variables (see `.env.example` for the full list):
 | `SANDFISH_MAX_AGENTS` / `SANDFISH_MAX_ROUNDS` | Per-simulation caps in the API (`0` = unlimited) | `1000` / `10000` |
 | `SANDFISH_MAX_CONCURRENT_SIMULATIONS` | Simulations running at once in the API | `4` |
 | `SANDFISH_MAX_FINISHED_SIMULATIONS` | Finished simulations kept; oldest evicted | `100` |
+| `SANDFISH_MAX_SEARCH_EVALUATIONS` | Cap on evaluations per MCP search (grid size, or agents × rounds) | `10000` |
 | `SANDFISH_CORS_ORIGINS` | Browser origins allowed for REST and `/ws`. Accepts `localhost`, `none`, explicit `https://…` origins, or `*`. `*` needs `SANDFISH_API_KEY`, or startup fails | unset = `localhost` (loopback origins only) |
 | `LLM_API_KEY` | Slot for user-provided LLM-backed agents | unset |
 
@@ -236,6 +241,12 @@ sandfish-mcp --vault ./sandfish_vault
 | `sf_results` / `sf_report` | Metrics and top agents as JSON / as a Markdown report |
 | `sf_memory_search` | Search the OMPA memory; `reference_date` anchors "yesterday" in simulated time |
 | `sf_memory_entity` | One entity's facts and interactions, optionally `as_of` a date |
+| `sf_search_evaluators` | List evaluators usable by name (`toy` plus installed plugins) |
+| `sf_search_run` | Start a parameter search: `strategy` `grid` or `swarm`, `evaluator`, `space`, `seed`, … |
+| `sf_search_ledger` | Read trial-ledger rows (paged, optional `split`) with counts and the hash-chain check |
+| `sf_search_summary` | Exact trial counts, integrity, best/top train variants and any test scores |
+| `sf_search_validate` | Score finalists on the held-out `test` split (logged in the same ledger); `dedupe_metadata_fields` drops duplicate finalists |
+| `sf_search_overfit` | Holdout-guard status, train-vs-test degradation, walk-forward runs and (for Sharpe scores) the Deflated Sharpe Ratio using the ledger's N |
 
 Resources:
 
@@ -271,6 +282,167 @@ working directory. If `sandfish-mcp` isn't on the client's `PATH`, use
 `"command": "/path/to/venv/bin/python", "args": ["-m", "sandfish.mcp_server", ...]`
 instead.
 
+## Parameter search (opt-in)
+
+`sandfish.search` reuses the orchestrator for a different job: a swarm of
+*researcher* agents proposes variants from a discrete parameter space, an
+**external evaluator** you supply scores each one, and every evaluation is
+written to an append-only trial ledger. None of it runs unless you call it;
+the social-simulation agents and defaults behave exactly as before.
+
+**What SandFish is and is not here.** SandFish is an orchestration and audit
+layer. It is not a backtester, and it does not generate prices, forecasts or
+base rates. All data access, modelling and scoring happen inside your
+evaluator; SandFish only decides which variant to try next and records what
+happened.
+
+**Use a plain grid when you can.** If the space is small enough to enumerate,
+evaluate all of it (`run_grid`, or `sf_search_run` with `strategy="grid"`).
+A grid gives an exact trial count and has no path dependence. The swarm is
+for spaces too large to enumerate, and it adds orchestration and logging,
+not signal.
+
+**Validate on held-out data, and count every trial.** A variant picked by
+agents (or by you, from a grid) is selected on the training split, so its
+training score is biased upward. Re-score finalists on held-out data
+(`validate_holdout`, or `sf_search_validate`) before trusting them. Pick the
+finalists first and validate once; every test-split evaluation is logged too,
+so repeated peeking shows up. For a multiple-testing correction (Bonferroni,
+deflated Sharpe ratio, and so on), use the ledger's count of distinct
+variants tried on the training split, `counts.by_split.train.unique_variants`,
+plus anything you tried outside this ledger, as the number of trials N, never
+the number of finalists.
+
+### Evaluator interface
+
+An evaluator takes a proposed variant (a dict of parameter values) and a
+split name (`"train"` or `"test"`) and returns a score plus metadata:
+
+```python
+from sandfish.search import EvaluationResult
+
+class MyEvaluator:
+    name = "my_eval"
+
+    def evaluate(self, variant: dict, split: str) -> EvaluationResult:
+        rows = load_rows(split)          # your data; keep "test" unseen during search
+        score, n = my_metric(rows, **variant)
+        return EvaluationResult(score=score, n=n, metadata={"note": "..."})
+```
+
+A plain function `fn(variant, split)` works too, and you may return a dict
+with a numeric `score` (optional `n` and `metadata`) instead of an
+`EvaluationResult`. The search always evaluates on `"train"`; only
+`validate_holdout` uses `"test"`. An evaluator that raises is recorded as an
+error row (a failed evaluation still counts as a trial).
+
+To make an evaluator available by name (and so to the MCP server), register a
+factory with `register_evaluator("my_eval", factory)` or ship it as a plugin in
+any installed package:
+
+```toml
+[project.entry-points."sandfish.evaluators"]
+my_eval = "my_pkg.evaluators:make_evaluator"   # factory(**options) -> evaluator
+```
+
+Only registered names and installed entry points can be loaded by name.
+`toy` (`ToyQuadraticEvaluator`) is built in for tests and examples: a
+synthetic quadratic with different deterministic noise on each split.
+
+### Python
+
+```python
+import asyncio
+from sandfish.core.orchestrator import create_orchestrator
+from sandfish.search import ToyQuadraticEvaluator, TrialLedger, run_grid, run_search, validate_holdout
+
+toy = ToyQuadraticEvaluator()
+space = {"x": [-3, -2, -1, 0, 1, 2, 3], "y": [-3, -2, -1, 0, 1, 2, 3]}
+
+grid = TrialLedger("ledgers/grid.jsonl")
+run_grid(space, toy, grid)                       # 49 evaluations, exact
+
+orch = create_orchestrator("./sandfish_vault")
+swarm = TrialLedger("ledgers/swarm.jsonl")
+summary = asyncio.run(run_search(orch, space=space, evaluator=toy, ledger=swarm,
+                                 num_agents=4, max_rounds=10, seed=7))
+print(summary["counts"])                         # every evaluation, repeats included
+print(validate_holdout(swarm, toy, top_k=3))     # finalists re-scored on "test"
+orch.close()
+```
+
+For full control, create a simulation with agent types `researcher`,
+`researcher_explorer` (mostly random draws) or `researcher_exploiter` (mostly
+one-parameter changes to the current best), call `register_search_agents()`
+and `attach_search(orch, sim_id, space=..., evaluator=..., ledger=...)`, then
+run it as usual. `repair=` maps a proposed variant to a valid one, `min_n=`
+ignores small-sample results when choosing what to exploit, and
+`remember=True` also writes each new variant to OMPA memory.
+
+### Trial ledger
+
+One JSON object per line, never rewritten. Each row has `seq`, `ts`,
+`run_id`, `source` (agent id, `grid` or `holdout`), `round`, `split`,
+`evaluator`, `variant`, `key`, `result` (`score`, `n`, `metadata`) or
+`error`, `cached` (a repeat that reused the earlier score), `prev` and `hash`.
+`hash` is the SHA-256 of the row without it, and `prev` links to the previous
+row, so `verify_ledger_file(path)` detects edited, deleted, reordered or
+corrupted rows, and an interrupted last write. Rows removed from the *end*
+can't be detected from the file alone, so keep the `head` hash a summary
+returns and pass it later as `verify_ledger_file(path, expected_head=...)`.
+This is tamper evidence for an honest audit trail, not protection against
+someone who rewrites the whole file. Reopening a ledger verifies it and
+appends after the last row; use one writer process per ledger file, and one
+ledger per evaluator configuration (repeats reuse an earlier score only for
+the same split and evaluator name). `counts()` reports `n_trials` (every
+row), `n_evaluator_calls`, `n_unique` and the same per split.
+
+Over MCP, both strategies run in the background (`wait_seconds` ≤ 300 waits
+for them), evaluator options from the client are passed to the evaluator's
+factory (so plugin factories must treat them as untrusted), and ledgers are
+written to `<vault>/search_ledgers/<search_id>.jsonl`, where
+`sf_search_ledger` / `sf_search_summary` can still read them after a restart.
+`sf_search_validate` refuses while a search is still running or paused.
+
+### Robustness and overfitting checks
+
+Everything here is opt-in and leaves the default paths unchanged.
+
+- **Invalid combinations:** `run_grid(space, ev, ledger, valid=lambda v: v["fast"] < v["slow"])`
+  skips combinations that make no sense. They are never evaluated or recorded,
+  so the ledger's N counts hypotheses actually tested (the result reports
+  `grid_size`, `valid_size` and `skipped_invalid`).
+- **Not scorable:** return `EvaluationResult.not_scorable(n=3, reason="too few
+  trades")` (or `{"score": None}`) when the sample is too small to score. The
+  trial is recorded and counted in N, but `best()`/`top()`, the researcher
+  agents and `validate_holdout` never rank it. Use this instead of a fake `0.0`.
+- **Deterministic content head:** `ledger.content_head()` hashes each row
+  without its timestamp, run id and chain hashes, so two identical, seeded
+  runs give the same content head even though their `head` differs.
+- **Duplicate finalists:** `validate_holdout(..., dedupe_key=dedupe_by_metadata("trade_set_hash"))`
+  (or `dedupe_by_score(params=[...])`, or your own `row -> fingerprint`) keeps
+  near-identical finalists from filling `top_k`; dropped ones are listed in
+  `result.skipped`.
+- **Locked holdout:** `ledger.lock_holdout()` (or `lock_holdout=True` on
+  `run_grid`/`run_search`/`sf_search_run`) makes `validate_holdout` the only
+  way to score the test split, once. Any other attempt raises
+  `HoldoutLockedError` before the evaluator runs. The lock, each denied
+  attempt and the validation are written to the ledger as *event rows* in the
+  same hash chain (they are not trials and never count towards N). A second
+  validation needs `allow_repeat=True` and is logged as a reopening.
+- **Statistics** (`sandfish.search.overfit`, formulas cited in the docstrings;
+  checked against independently computed reference values in the tests):
+  `deflated_sharpe_ratio` / `ledger_deflated_sharpe` (Bailey & López de Prado,
+  2014; give `score_is_sharpe=True`, since SandFish cannot know what a score
+  means), `probability_of_backtest_overfitting` (CSCV, Bailey et al., 2017;
+  needs a T x N returns matrix, so it is Python-only), `make_walk_forward_folds`
+  and `walk_forward` (rolling or expanding windows, with an embargo; your
+  evaluator implements `evaluate_fold(variant, fold)` on train-split data), and
+  `holdout_report`. `summarize(ledger, overfit={"score_is_sharpe": True})` and
+  `sf_search_overfit` bundle what a ledger alone can answer. These are
+  diagnostics, not guarantees: they assume trials are roughly independent and
+  N is honest.
+
 ## Docker
 
 ```bash
@@ -292,6 +464,7 @@ sandfish/
   api/          FastAPI app, auth, rate limit, event stream.
   core/         SwarmOrchestrator and simulation config.
   memory/       OMPAMemoryAdapter wrapper around the OMPA vault.
+  search/       Opt-in parameter search: evaluators, trial ledger, researcher agents.
   security/     Static security auditor.
   cli.py        `sandfish` entry point.
   mcp_server.py `sandfish-mcp` MCP server (stdio; `[mcp]` extra).

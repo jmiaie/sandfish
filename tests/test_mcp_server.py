@@ -16,6 +16,8 @@ EXPECTED_TOOLS = {
     "sf_create_simulation", "sf_start", "sf_pause", "sf_resume", "sf_stop",
     "sf_status", "sf_list", "sf_results", "sf_report",
     "sf_memory_search", "sf_memory_entity",
+    "sf_search_evaluators", "sf_search_run", "sf_search_ledger", "sf_search_summary",
+    "sf_search_validate", "sf_search_overfit",
 }
 
 
@@ -250,3 +252,270 @@ def test_cli_version(capsys):
         main(["--version"])
     assert exc.value.code == 0
     assert "sandfish-mcp" in capsys.readouterr().out
+
+
+# ----- opt-in parameter search tools -----
+
+
+@pytest.mark.asyncio
+async def test_search_grid_ledger_summary_validate(server):
+    async with Client(server, cache=None) as c:
+        evs = await _ok(c, "sf_search_evaluators")
+        toy = next(e for e in evs["evaluators"] if e["name"] == "toy")
+        assert toy["default_space"]["x"] == [-3, -2, -1, 0, 1, 2, 3]
+        assert evs["max_evaluations"] == 10_000
+
+        run = await _ok(c, "sf_search_run", evaluator="toy", strategy="grid", wait_seconds=30)
+        sid = run["search_id"]
+        assert sid.startswith("grid-") and run["status"] == "completed"
+        assert run["grid_size"] == 49 and run["counts"]["n_trials"] == 49
+        assert run["integrity"]["ok"] and run["ledger_file"] == f"search_ledgers/{sid}.jsonl"
+        assert "multiple-testing" in run["multiple_testing"]
+
+        page = await _ok(c, "sf_search_ledger", search_id=sid, offset=40, limit=5)
+        assert page["returned"] == 5 and [r["seq"] for r in page["rows"]] == [40, 41, 42, 43, 44]
+        assert page["integrity"]["ok"]
+
+        val = await _ok(c, "sf_search_validate", search_id=sid, top_k=2)
+        assert len(val["results"]) == 2 and val["counts"]["by_split"]["test"]["trials"] == 2
+        mine = await _ok(c, "sf_search_validate", search_id=sid, variants=[{"x": 0, "y": 0}])
+        assert mine["results"][0]["train_score"] is not None
+        test_rows = await _ok(c, "sf_search_ledger", search_id=sid, split="test")
+        assert test_rows["returned"] == 3
+
+        summary = await _ok(c, "sf_search_summary", search_id=sid, top=3)
+        assert len(summary["top_train"]) == 3 and summary["counts"]["n_trials"] == 52
+        assert summary["top_train"][0]["test_score"] is not None
+        assert (server.sandfish.ledger_dir / f"{sid}.jsonl").exists()
+
+
+@pytest.mark.asyncio
+async def test_search_swarm_runs_in_background_and_reproduces(tmp_path):
+    keys = []
+    for tag in ("a", "b"):
+        srv = build_server(str(tmp_path / f"v{tag}"), enable_semantic=False)
+        try:
+            async with Client(srv, cache=None) as c:
+                run = await _ok(c, "sf_search_run", evaluator="toy", num_agents=3, max_rounds=5,
+                                seed=9, wait_seconds=30)
+                sid = run["search_id"]
+                assert run["strategy"] == "swarm" and run["simulation_id"] == sid
+                assert run["status"] == "completed" and run["counts"]["n_trials"] == 15
+                st = await _ok(c, "sf_status", simulation_id=sid)
+                assert st["status"] == "completed"
+                res = await _ok(c, "sf_results", simulation_id=sid)
+                assert res["metrics"]["search_trials"] == 15.0
+                rows = (await _ok(c, "sf_search_ledger", search_id=sid, limit=500))["rows"]
+                keys.append([r["key"] for r in rows])
+        finally:
+            srv.sandfish.close()
+    assert keys[0] == keys[1] and len(keys[0]) == 15
+
+
+@pytest.mark.asyncio
+async def test_search_errors(server, monkeypatch):
+    async with Client(server, cache=None) as c:
+        bad = [
+            ({"evaluator": "nope"}, "unknown evaluator"),
+            ({"strategy": "anneal"}, "strategy"),
+            ({"space": {"x": []}}, "no values"),
+            ({"evaluator_options": {"noise": -1}}, "Could not build"),
+            ({"evaluator_options": {"bogus": 1}}, "Could not build"),
+            ({"evaluator_options": {"target": 5}}, "Could not build"),
+            ({"name": " "}, "name"),
+            ({"min_n": -1}, "min_n"),
+            ({"num_agents": 0}, ">= 1"),
+            ({"num_agents": 200, "max_rounds": 100}, "exceeds the limit"),
+        ]
+        for args, msg in bad:
+            r = await _call(c, "sf_search_run", **args)
+            assert r.is_error and msg in r.content[0].text, (args, r.content[0].text)
+        monkeypatch.setenv("SANDFISH_MAX_SEARCH_EVALUATIONS", "10")
+        r = await _call(c, "sf_search_run", strategy="grid")
+        assert r.is_error and "49 variants" in r.content[0].text
+        for tool in ("sf_search_ledger", "sf_search_summary"):
+            for bad_id in ("../etc", "abc\n", ""):
+                r = await _call(c, tool, search_id=bad_id)
+                assert r.is_error and "search_id" in r.content[0].text
+            r = await _call(c, tool, search_id="missing")
+            assert r.is_error and "Unknown search_id" in r.content[0].text
+        r = await _call(c, "sf_search_ledger", search_id="missing", split="dev")
+        assert r.is_error and "split" in r.content[0].text
+        r = await _call(c, "sf_search_validate", search_id="missing")
+        assert r.is_error and "started by this server" in r.content[0].text
+        monkeypatch.setenv("SANDFISH_MAX_SEARCH_EVALUATIONS", "0")  # <= 0 falls back to default
+        sid = (await _ok(c, "sf_search_run", strategy="grid", space={"x": [0, 1], "y": [0]},
+                         wait_seconds=30))["search_id"]
+        for variants in ([], [{"x": [1]}]):
+            r = await _call(c, "sf_search_validate", search_id=sid, variants=variants)
+            assert r.is_error and "variant" in r.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_search_validate_refused_while_running_and_ledgers_survive_restart(tmp_path):
+    vault = str(tmp_path / "v")
+    srv = build_server(vault, enable_semantic=False)
+    app = srv.sandfish
+    original = app.orchestrator._execute_round
+
+    async def slow(sim_id, round_num):
+        await asyncio.sleep(0.05)
+        await original(sim_id, round_num)
+
+    app.orchestrator._execute_round = slow
+    try:
+        async with Client(srv, cache=None) as c:
+            run = await _ok(c, "sf_search_run", num_agents=2, max_rounds=20, seed=1)
+            sid = run["search_id"]
+            r = await _call(c, "sf_search_validate", search_id=sid)
+            assert r.is_error and "still running" in r.content[0].text
+            await _ok(c, "sf_stop", simulation_id=sid)
+            await _wait_status(c, sid, {"stopped"})
+            for _ in range(200):
+                if app.tasks[sid].done():
+                    break
+                await asyncio.sleep(0.01)
+            n = (await _ok(c, "sf_search_summary", search_id=sid))["counts"]["n_trials"]
+            assert 0 < n < 40 and n % 2 == 0
+    finally:
+        app.close()
+
+    srv2 = build_server(vault, enable_semantic=False)
+    try:
+        async with Client(srv2, cache=None) as c:
+            s = await _ok(c, "sf_search_summary", search_id=sid)
+            assert s["status"] == "on_disk" and not s["live"] and s["counts"]["n_trials"] == n
+            assert s["integrity"]["ok"]
+            path = srv2.sandfish.ledger_path(sid)
+            lines = path.read_text().splitlines()
+            path.write_text("\n".join(lines[1:]) + "\n")
+            r = await _call(c, "sf_search_ledger", search_id=sid)
+            assert r.is_error and "failed verification" in r.content[0].text
+    finally:
+        srv2.sandfish.close()
+
+
+@pytest.mark.asyncio
+async def test_search_grid_background_stop_failure_and_eviction(tmp_path, monkeypatch):
+    import threading
+
+    from sandfish import mcp_server as mod
+    from sandfish.search import register_evaluator, unregister_evaluator
+
+    gate, entered = threading.Event(), threading.Event()
+
+    def slow_factory():
+        def fn(v, split):
+            entered.set()
+            gate.wait(5)
+            return {"score": v["a"]}
+        return fn
+
+    register_evaluator("unit_slow", slow_factory, replace=True)
+    monkeypatch.setattr(mod, "MAX_LIVE_SEARCHES", 2)
+    srv = build_server(str(tmp_path / "v"), enable_semantic=False)
+    app = srv.sandfish
+    try:
+        async with Client(srv, cache=None) as c:
+            run = await _ok(c, "sf_search_run", evaluator="unit_slow", strategy="grid",
+                            space={"a": [1, 2, 3]})
+            sid = run["search_id"]
+            assert run["status"] == "running"
+            r = await _call(c, "sf_search_validate", search_id=sid)
+            assert r.is_error and "still running" in r.content[0].text
+            assert await asyncio.to_thread(entered.wait, 5)  # first evaluation in progress
+            app.searches[sid].stop = True
+            gate.set()
+            await asyncio.wait_for(asyncio.shield(app.searches[sid].task), 5)
+            s = await _ok(c, "sf_search_summary", search_id=sid)
+            assert s["status"] == "stopped" and s["counts"]["n_trials"] == 1
+
+            def boom(*a, **k):
+                raise RuntimeError("grid crashed")
+
+            monkeypatch.setattr(mod, "run_grid", boom)
+            r = await _ok(c, "sf_search_run", strategy="grid", wait_seconds=10)
+            assert r["status"] == "failed" and r["error"] == "grid crashed"
+
+            # A swarm search whose simulation was evicted still reports.
+            sw = await _ok(c, "sf_search_run", num_agents=1, max_rounds=2, seed=1, wait_seconds=30)
+            del app.orchestrator.simulations[sw["search_id"]]
+            st = await _ok(c, "sf_search_summary", search_id=sw["search_id"])
+            assert st["status"] == "finished" and st["counts"]["n_trials"] == 2
+            await _ok(c, "sf_search_validate", search_id=sw["search_id"], top_k=1)
+
+            # Cap of 2 live searches: the oldest finished ones were forgotten
+            # but their ledgers are still readable from disk.
+            assert len(app.searches) == 2 and sid not in app.searches
+            s = await _ok(c, "sf_search_summary", search_id=sid)
+            assert s["status"] == "on_disk" and s["counts"]["n_trials"] >= 1
+    finally:
+        app.close()
+        unregister_evaluator("unit_slow")
+
+
+@pytest.mark.asyncio
+async def test_search_overfit_tools_lock_dedupe_and_report(server):
+    async with Client(server, cache=None) as c:
+        sid = (await _ok(c, "sf_search_run", strategy="grid", lock_holdout=True,
+                         wait_seconds=30))["search_id"]
+        s = await _ok(c, "sf_search_summary", search_id=sid)
+        assert s["holdout_guard"]["state"] == "locked" and s["holdout_guard"]["clean"]
+        assert s["content_head"] and s["counts"]["n_trials"] == 49
+
+        val = await _ok(c, "sf_search_validate", search_id=sid, top_k=3,
+                        dedupe_metadata_fields=["distance2"])
+        dists = [r["variant"] for r in val["results"]]
+        assert len(dists) == 3 and val["holdout_guard"]["state"] == "consumed"
+        top_dist = {(v["x"] - 1) ** 2 + (v["y"] + 2) ** 2 for v in dists}
+        assert len(top_dist) == 3  # no two finalists share the same distance (trade-set stand-in)
+        assert isinstance(val["skipped_duplicates"], list)
+
+        r = await _call(c, "sf_search_validate", search_id=sid, top_k=3)
+        assert r.is_error and "already consumed" in r.content[0].text
+        again = await _ok(c, "sf_search_validate", search_id=sid, top_k=1, allow_repeat=True)
+        assert len(again["results"]) == 1 and again["holdout_guard"]["validations"] == 2
+
+        rep = await _ok(c, "sf_search_overfit", search_id=sid)
+        assert rep["holdout"]["n_pairs"] >= 3 and rep["n_trials_train"] == 49
+        assert rep["holdout_guard"]["state"] == "consumed"
+        assert rep["deflated_sharpe"]["available"] is False
+        dsr = await _ok(c, "sf_search_overfit", search_id=sid, score_is_sharpe=True, n_obs=100)
+        assert dsr["deflated_sharpe"]["available"] and dsr["deflated_sharpe"]["n_trials"] == 49
+        assert 0.0 <= dsr["deflated_sharpe"]["dsr"] <= 1.0
+
+        # An unguarded search is unchanged: validate can repeat.
+        sid2 = (await _ok(c, "sf_search_run", strategy="grid", space={"x": [0, 1], "y": [0]},
+                          wait_seconds=30))["search_id"]
+        await _ok(c, "sf_search_validate", search_id=sid2, top_k=1)
+        await _ok(c, "sf_search_validate", search_id=sid2, top_k=1)
+
+        for args in ({"periods_per_year": 0}, {"n_obs": 1}, {"n_trials": 0}):
+            r = await _call(c, "sf_search_overfit", search_id=sid, **args)
+            assert r.is_error
+        r = await _call(c, "sf_search_overfit", search_id="missing")
+        assert r.is_error and "Unknown search_id" in r.content[0].text
+        r = await _call(c, "sf_search_overfit", search_id=sid, score_is_sharpe=True, periods_per_year=1,
+                        n_obs=5, n_trials=2)
+        assert not r.is_error
+        r = await _call(c, "sf_search_validate", search_id=sid2, dedupe_metadata_fields=[""])
+        assert r.is_error and "dedupe_metadata_fields" in r.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_search_overfit_reads_ledgers_left_by_an_earlier_server(tmp_path):
+    vault = str(tmp_path / "v")
+    srv = build_server(vault, enable_semantic=False)
+    try:
+        async with Client(srv, cache=None) as c:
+            sid = (await _ok(c, "sf_search_run", strategy="grid", lock_holdout=True,
+                             wait_seconds=30))["search_id"]
+    finally:
+        srv.sandfish.close()
+    srv2 = build_server(vault, enable_semantic=False)
+    try:
+        async with Client(srv2, cache=None) as c:
+            rep = await _ok(c, "sf_search_overfit", search_id=sid)
+            assert rep["holdout_guard"]["state"] == "locked" and rep["holdout"]["n_pairs"] == 0
+    finally:
+        srv2.sandfish.close()
