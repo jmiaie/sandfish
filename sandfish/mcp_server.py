@@ -61,7 +61,7 @@ from .core.orchestrator import (
     SimulationStatus,
     SwarmOrchestrator,
 )
-from .memory.ompa_adapter import OMPAMemoryAdapter
+from .memory.ompa_adapter import OMPAMemoryAdapter, default_vault_path
 from .search import (
     TrialLedger,
     attach_search,
@@ -381,9 +381,7 @@ def build_server(
     enable_semantic: Optional[bool] = None,
 ) -> MCPServer:
     """Build the MCP server. ``server.sandfish`` exposes the state for tests."""
-    vault = vault_path or os.environ.get("SANDFISH_VAULT_PATH") or os.environ.get(
-        "OMPA_VAULT_PATH", "./sandfish_vault"
-    )
+    vault = vault_path or default_vault_path(legacy_fallback=True)
     app = SandfishMCP(vault, limits=limits, enable_semantic=enable_semantic)
     server = MCPServer(
         name="sandfish",
@@ -396,7 +394,8 @@ def build_server(
         name="sf_create_simulation",
         description=(
             "Create a simulation (not started). agent_types cycles over the agents; "
-            "known types: default, influencer, lurker (and llm when enabled). "
+            "known types: default, influencer, lurker, and llm when the operator "
+            "started this server with SANDFISH_SERVER_LLM_AGENTS=1. "
             "start_date (YYYY-MM-DD) dates memory writes in simulated time; "
             "seed makes runs reproducible."
         ),
@@ -873,7 +872,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--vault",
         default=None,
-        help="OMPA vault directory (default: $SANDFISH_VAULT_PATH, $OMPA_VAULT_PATH or ./sandfish_vault)",
+        help="OMPA vault directory (default: $SANDFISH_VAULT_PATH, else ./sandfish_vault)",
     )
     parser.add_argument("--version", action="version", version=f"sandfish-mcp {__version__}")
     args = parser.parse_args(argv)
@@ -883,6 +882,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         stream=sys.stderr,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # Off unless the operator set SANDFISH_SERVER_LLM_AGENTS.
+    from .llm.agent import enable_llm_agents_from_env
+    from .llm.base import LLMError
+
+    try:
+        enable_llm_agents_from_env()
+    except LLMError as exc:
+        print(f"sandfish-mcp: {exc}", file=sys.stderr)
+        return 2
     server = build_server(args.vault)
     try:
         server.run("stdio")

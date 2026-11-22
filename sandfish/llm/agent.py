@@ -18,7 +18,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Dict, List, Optional
+import os
+from typing import Any, Dict, List, Mapping, Optional
 
 from ..agents.base_agent import (
     _AGENT_TARGETED_ACTIONS,
@@ -29,7 +30,7 @@ from ..agents.base_agent import (
     DefaultAgent,
     register_agent_type,
 )
-from .base import LLMBudget, LLMBudgetExhausted, LLMClient, action_schema, usage_sink
+from .base import LLMBudget, LLMBudgetExhausted, LLMClient, LLMError, action_schema, usage_sink
 
 logger = logging.getLogger("sandfish.llm")
 
@@ -235,6 +236,68 @@ def enable_llm_agents(
     if type_name not in AGENT_TYPES or AGENT_TYPES[type_name] is not LLMAgent:
         register_agent_type(type_name, LLMAgent)
     return LLMAgent.budget
+
+
+SERVER_OPT_IN = "SANDFISH_SERVER_LLM_AGENTS"
+DEFAULT_SERVER_CALLS_PER_SIMULATION = 200
+DEFAULT_SERVER_TOTAL_CALLS = 2000
+
+
+def _cap(env: Mapping[str, str], name: str, default: int) -> Optional[int]:
+    raw = str(env.get(name, "") or "").strip()
+    try:
+        value = int(raw) if raw else default
+    except ValueError:
+        raise LLMError(f"{name} must be a whole number, got {raw!r}") from None
+    return None if value <= 0 else value
+
+
+def enable_llm_agents_from_env(env: Optional[Mapping[str, str]] = None) -> Optional[LLMBudget]:
+    """Let a server's callers run ``llm`` agents, if its operator asked for it.
+
+    The HTTP API and the MCP server call this at start-up. Callers of a
+    server choose the agent types, and every ``llm`` agent spends the
+    operator's provider key, so nothing is enabled unless the operator sets
+    ``SANDFISH_SERVER_LLM_AGENTS=1``. A provider configured for the command
+    line (``SANDFISH_LLM_PROVIDER`` alone) does not turn it on.
+
+    - ``SANDFISH_LLM_PROVIDER``: required with the opt-in.
+    - ``SANDFISH_LLM_MAX_CALLS``: requests per simulation (default 200).
+    - ``SANDFISH_LLM_MAX_TOTAL_CALLS``: requests for the life of the process
+      (default 2,000). ``0`` lifts either cap.
+
+    Returns the process-wide budget, or None when the opt-in is not set.
+    Raises ``LLMError`` when it is set but the rest is missing or invalid, so
+    a server does not start half-configured.
+    """
+    env = os.environ if env is None else env
+    if str(env.get(SERVER_OPT_IN, "") or "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return None
+    provider = str(env.get("SANDFISH_LLM_PROVIDER", "") or "").strip()
+    if not provider:
+        raise LLMError(f"{SERVER_OPT_IN} is set but SANDFISH_LLM_PROVIDER is not")
+    per_simulation = _cap(env, "SANDFISH_LLM_MAX_CALLS", DEFAULT_SERVER_CALLS_PER_SIMULATION)
+    total = _cap(env, "SANDFISH_LLM_MAX_TOTAL_CALLS", DEFAULT_SERVER_TOTAL_CALLS)
+    from .providers import client_from_env
+
+    client = client_from_env(provider)
+    budget = enable_llm_agents(client, max_calls=per_simulation, max_total_calls=total)
+    logger.warning(
+        "LLM agents are available to this server's callers: %s:%s, at most %s requests "
+        "per simulation and %s in total.",
+        client.name,
+        client.model,
+        per_simulation if per_simulation is not None else "unlimited",
+        total if total is not None else "unlimited",
+    )
+    return budget
+
+
+async def close_llm_client() -> None:
+    """Close the registered client's connection pool, if it has one."""
+    aclose = getattr(LLMAgent.client, "aclose", None)
+    if aclose is not None:
+        await aclose()
 
 
 def disable_llm_agents(type_name: str = "llm") -> None:

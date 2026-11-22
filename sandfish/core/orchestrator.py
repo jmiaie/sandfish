@@ -153,9 +153,15 @@ class SwarmOrchestrator:
         memory_adapter: OMPAMemoryAdapter,
         checkpoint_dir: Optional[Path] = None,
         limits: Optional[SimulationLimits] = None,
+        keep_checkpoints: Optional[int] = 5,
     ):
         self.memory = memory_adapter
         self.limits = limits or SimulationLimits()
+        # How many of a simulation's newest checkpoints stay in memory
+        # (None keeps them all). `checkpoint_dir` is unaffected.
+        if keep_checkpoints is not None and keep_checkpoints < 1:
+            raise ValueError("keep_checkpoints must be at least 1, or None for no limit")
+        self.keep_checkpoints = keep_checkpoints
         # One worker for blocking storage I/O (vault flushes, checkpoint
         # files): keeps it off the event loop, serialises writes, and bounds
         # the per-thread SQLite connections OMPA opens to one extra thread.
@@ -242,6 +248,7 @@ class SwarmOrchestrator:
             "start_time": None,
             "end_time": None,
             "checkpoints": [],
+            "checkpoint_count": 0,
             "error": None,
             # Snapshot taken when agents are released; see _release_agents.
             "final_state": None,
@@ -578,7 +585,15 @@ class SwarmOrchestrator:
                 if aid in self.agents
             },
         }
-        sim["checkpoints"].append(checkpoint)
+        # Only the newest few stay in memory: each one is a copy of every
+        # agent's state, nothing reads the older ones, and a long run would
+        # otherwise grow by one copy per interval. `checkpoint_dir` keeps
+        # them all on disk.
+        kept = sim["checkpoints"]
+        kept.append(checkpoint)
+        if self.keep_checkpoints is not None and len(kept) > self.keep_checkpoints:
+            del kept[: len(kept) - self.keep_checkpoints]
+        sim["checkpoint_count"] += 1
         sim["last_checkpoint_round"] = rounds_completed
 
         if self.checkpoint_dir is not None:
@@ -817,7 +832,7 @@ class SwarmOrchestrator:
         metrics = {
             "completion_rate": min(1.0, self._rounds_completed(sim) / max_rounds),
             "agent_count": float(len(sim["agents"])),
-            "checkpoint_count": float(len(sim["checkpoints"])),
+            "checkpoint_count": float(sim["checkpoint_count"]),
         }
         budget = sim.get("context", {}).get("llm_budget")
         if budget is not None:

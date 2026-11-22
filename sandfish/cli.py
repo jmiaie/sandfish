@@ -20,6 +20,7 @@ from typing import Any, Dict, Optional
 
 from . import __version__
 from .core.orchestrator import SimulationConfig, create_orchestrator
+from .memory.ompa_adapter import default_vault_path
 from .security.audit import SecurityAuditor
 
 BANNER = """
@@ -120,6 +121,7 @@ def cmd_orchestrator(args: argparse.Namespace) -> int:
 
     config = _build_simulation_config(args, config_data)
     llm_budget = None
+    client = None
     if "llm" in config.agent_types:
         # Opt-in only: provider from --llm-provider or SANDFISH_LLM_PROVIDER.
         from .llm import client_from_env
@@ -142,7 +144,16 @@ def cmd_orchestrator(args: argparse.Namespace) -> int:
         return 0
 
     print(f"Running {config.max_rounds} rounds across {config.num_agents} agents...")
-    result = asyncio.run(orchestrator.run_simulation(sim_id))
+
+    async def _run() -> Any:
+        try:
+            return await orchestrator.run_simulation(sim_id)
+        finally:
+            aclose = getattr(client, "aclose", None)
+            if aclose is not None:
+                await aclose()  # the provider's connection pool
+
+    result = asyncio.run(_run())
 
     print()
     print("Simulation complete:")
@@ -239,7 +250,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # orchestrator
     orch = subparsers.add_parser("orchestrator", help="Run a simulation")
-    orch.add_argument("--vault", default="./sandfish_vault", help="Path to OMPA vault")
+    orch.add_argument(
+        "--vault",
+        default=default_vault_path(),
+        help="Path to OMPA vault (default: $SANDFISH_VAULT_PATH, else ./sandfish_vault)",
+    )
     orch.add_argument("--config", help="Path to JSON or YAML config file")
     orch.add_argument("--rounds", type=int, default=100, help="Number of simulation rounds")
     orch.add_argument("--agents", type=int, default=10, help="Number of agents")
@@ -281,7 +296,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Bind host (default 127.0.0.1; non-loopback requires SANDFISH_API_KEY)",
     )
     api.add_argument("--port", type=int, default=8000, help="Bind port")
-    api.add_argument("--vault", default="./sandfish_vault", help="Path to OMPA vault")
+    api.add_argument(
+        "--vault",
+        default=default_vault_path(),
+        help="Path to OMPA vault (default: $SANDFISH_VAULT_PATH, else ./sandfish_vault)",
+    )
     api.add_argument("--debug", action="store_true", help="Enable verbose error responses")
     api.set_defaults(func=cmd_api)
 

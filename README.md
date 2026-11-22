@@ -99,6 +99,11 @@ checkpointed, even when the round count is not a multiple of
 `checkpoint_interval` or the run was stopped early. Set
 `checkpoint_interval: 0` to disable checkpointing.
 
+A running orchestrator keeps the five newest checkpoints of each simulation
+in memory (`SwarmOrchestrator(..., keep_checkpoints=N)`, `None` for all);
+`--checkpoint-dir` writes every one to disk. Checkpoints are snapshots for
+inspection: there is no command that resumes a run from one.
+
 ### Run the HTTP API
 
 ```bash
@@ -158,16 +163,18 @@ Environment variables (see `.env.example` for the full list):
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
-| `OMPA_VAULT_PATH` | Directory for OMPA-backed memory | `./sandfish_vault` |
+| `SANDFISH_VAULT_PATH` | Directory for Sandfish's OMPA vault (`--vault` overrides it). `OMPA_VAULT_PATH` is still read as a fallback by `sandfish-mcp`, and by the API when it is started without `sandfish api`, with a warning: OMPA's own MCP server uses that variable for an agent's real memory, so sharing it puts simulation notes there | `./sandfish_vault` |
 | `SANDFISH_API_KEY` | If set, `/api/*` requires an `X-API-Key` header | unset (auth off) |
 | `SANDFISH_RATE_LIMIT_PER_MINUTE` | Sliding-window rate limit per key/IP | `120` |
-| `SANDFISH_AUTH_FAILURES_PER_MINUTE` | Failed auth attempts allowed per IP before 429 | `10` |
+| `SANDFISH_AUTH_FAILURES_PER_MINUTE` | Wrong keys allowed per IP per minute before they get 429. The right key is never locked out, unless the key is shorter than 16 characters (then an IP over the limit is refused whatever key it sends) | `10` |
 | `SANDFISH_MAX_AGENTS` / `SANDFISH_MAX_ROUNDS` | Per-simulation caps in the API (`0` = unlimited) | `1000` / `10000` |
 | `SANDFISH_MAX_CONCURRENT_SIMULATIONS` | Simulations running at once in the API | `4` |
 | `SANDFISH_MAX_FINISHED_SIMULATIONS` | Finished simulations kept; oldest evicted | `100` |
 | `SANDFISH_MAX_SEARCH_EVALUATIONS` | Cap on evaluations per MCP search (grid size, or agents × rounds) | `10000` |
 | `SANDFISH_CORS_ORIGINS` | Browser origins allowed for REST and `/ws`. Accepts `localhost`, `none`, explicit `https://…` origins, or `*`. `*` needs `SANDFISH_API_KEY`, or startup fails | unset = `localhost` (loopback origins only) |
 | `LLM_API_KEY` | Slot for user-provided LLM-backed agents | unset |
+| `SANDFISH_SERVER_LLM_AGENTS` | `1` lets callers of the API and MCP server run `llm` agents on the operator's provider key (needs `SANDFISH_LLM_PROVIDER`) | unset (off) |
+| `SANDFISH_LLM_MAX_CALLS` / `SANDFISH_LLM_MAX_TOTAL_CALLS` | With the opt-in: provider requests per simulation / for the life of the process (`0` = unlimited) | `200` / `2000` |
 
 Leaving `SANDFISH_API_KEY` unset disables auth — fine for local work, which
 is why `sandfish api` binds `127.0.0.1` by default and refuses a non-loopback
@@ -216,9 +223,27 @@ sandfish orchestrator --agents 6 --rounds 5 --agent-types llm,default \
 - Hard call budget per simulation (`--llm-max-calls`, or
   `enable_llm_agents(client, max_calls=..., max_total_calls=...)` for an
   overall cap too); per-simulation calls and tokens appear in the results'
-  metrics. Retries on 429/5xx, and a heuristic fallback on any error; keys
-  are read from the environment and redacted from errors.
+  metrics. The budget counts requests sent to the provider: a retry on
+  429/5xx or a failed connection takes another unit, so a simulation never
+  sends more requests than its cap. Any error falls back to the heuristic;
+  keys are read from the environment and redacted from errors.
 - `MockLLMClient` (`--llm-provider mock`) for tests and dry runs.
+
+**On a server.** Callers of the HTTP API and of `sandfish-mcp` choose the
+agent types, and every `llm` agent spends the operator's provider key, so a
+server offers them only when its operator opts in:
+
+```bash
+export SANDFISH_SERVER_LLM_AGENTS=1       # the opt-in; a provider alone is not enough
+export SANDFISH_LLM_PROVIDER=anthropic
+export ANTHROPIC_API_KEY=...
+export SANDFISH_LLM_MAX_CALLS=200         # requests per simulation (default)
+export SANDFISH_LLM_MAX_TOTAL_CALLS=2000  # requests for the life of the process (default)
+sandfish api        # or: sandfish-mcp
+```
+
+`0` lifts either cap. With the opt-in set and no provider, the server refuses
+to start. Without it, `agent_types: ["llm"]` is rejected as an unknown type.
 
 ## MCP server (optional)
 

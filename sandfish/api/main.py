@@ -71,7 +71,7 @@ from ..core.orchestrator import (
     SimulationStatus,
     SwarmOrchestrator,
 )
-from ..memory.ompa_adapter import OMPAMemoryAdapter
+from ..memory.ompa_adapter import OMPAMemoryAdapter, default_vault_path
 from ..security.audit import run_security_audit
 
 logger = logging.getLogger("sandfish.api")
@@ -352,30 +352,51 @@ class _SlidingWindowLimiter:
 _limiter = _SlidingWindowLimiter(
     max_per_minute=int(os.environ.get("SANDFISH_RATE_LIMIT_PER_MINUTE", "120"))
 )
-# Failed authentications per client IP. Checked *before* the key compare, so
-# key guessing is throttled even though every guess is a distinct "client".
+# Failed authentications per client IP.
 _auth_fail_limiter = _SlidingWindowLimiter(
     max_per_minute=int(os.environ.get("SANDFISH_AUTH_FAILURES_PER_MINUTE", "10"))
 )
+
+# A key this long cannot be found by guessing over the network, whatever the
+# rate. `openssl rand -hex 32`, the documented way to make one, gives 64.
+MIN_STRONG_KEY_CHARS = 16
+
+
+def api_key_is_guessable(key: Optional[str] = None) -> bool:
+    """True when the configured key is short enough that guessing it online
+    is the realistic attack, so failed attempts have to be throttled."""
+    key = _api_key_setting() if key is None else key
+    return key is not None and len(key) < MIN_STRONG_KEY_CHARS
 
 
 async def _authenticate(conn: Any, provided: Optional[str]) -> bool:
     """Check `provided` against the configured key with failure throttling.
 
     Returns True when auth is off or the key matches. Raises HTTPException
-    429 while the client IP is over its failed-attempt budget.
+    429 for a wrong key while the client IP is over its failed-attempt budget.
+
+    The key is compared first, so the holder of the right key is not locked
+    out by someone else's wrong guesses from the same address; behind a NAT
+    or a reverse proxy that address is every client. Letting the right key
+    through while the address is over budget means the budget no longer
+    limits how fast keys can be tried, which only matters for a key short
+    enough to guess. Such a key keeps the old order: an address over budget
+    is refused before the key is looked at.
     """
     expected = _api_key_setting()
     if expected is None:
         return True
     ip = _client_ip(conn)
+    throttle_first = api_key_is_guessable(expected)
+    if not throttle_first and _keys_match(provided, expected):
+        return True
     retry = await _auth_fail_limiter.blocked(ip)
     if retry is not None:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=f"Too many failed authentication attempts. Retry in {retry:.1f}s.",
         )
-    if _keys_match(provided, expected):
+    if throttle_first and _keys_match(provided, expected):
         return True
     await _auth_fail_limiter.record(ip)
     return False
@@ -405,11 +426,7 @@ async def rate_limit(request: Request, _api_key: str = Depends(require_api_key))
 
 def _resolve_vault_path(app: FastAPI) -> str:
     cfg = getattr(app.state, "config", None) or {}
-    return (
-        cfg.get("ompa_vault_path")
-        or os.environ.get("OMPA_VAULT_PATH")
-        or "./sandfish_vault"
-    )
+    return cfg.get("ompa_vault_path") or default_vault_path(legacy_fallback=True)
 
 
 @asynccontextmanager
@@ -417,6 +434,19 @@ async def lifespan(app: FastAPI):
     global orchestrator
 
     cors_policy()  # refuse to start with an unsafe/invalid CORS setting
+    if api_key_is_guessable():
+        logger.warning(
+            "SANDFISH_API_KEY is shorter than %d characters. Failed attempts are "
+            "throttled per client address, which also locks out the right key from "
+            "an address that sent wrong ones. Use a longer key, e.g. "
+            "`openssl rand -hex 32`, to remove both the risk and the lockout.",
+            MIN_STRONG_KEY_CHARS,
+        )
+    # Off unless the operator set SANDFISH_SERVER_LLM_AGENTS; raises on a
+    # half-configured opt-in rather than starting without it.
+    from ..llm.agent import close_llm_client, disable_llm_agents, enable_llm_agents_from_env
+
+    llm_budget = enable_llm_agents_from_env()
     vault_path = _resolve_vault_path(app)
     memory = OMPAMemoryAdapter(vault_path)
     orchestrator = SwarmOrchestrator(memory, limits=SimulationLimits.from_env())
@@ -438,6 +468,9 @@ async def lifespan(app: FastAPI):
             *app.state.simulation_tasks.values(), return_exceptions=True
         )
         await asyncio.to_thread(orchestrator.close)
+    if llm_budget is not None:
+        await close_llm_client()
+        disable_llm_agents()
 
     async with _websocket_lock:
         clients = list(_websocket_clients)
@@ -1084,9 +1117,13 @@ async def generic_exception_handler(request: Request, exc: Exception):
 # ---------- Configuration helpers ----------
 
 
-def configure_app(vault_path: str = "./sandfish_vault", debug: bool = False) -> FastAPI:
-    """Configure the FastAPI app before launching it."""
-    app.state.config = {"ompa_vault_path": vault_path, "debug": debug}
+def configure_app(vault_path: Optional[str] = None, debug: bool = False) -> FastAPI:
+    """Configure the FastAPI app before launching it.
+
+    Without ``vault_path`` the vault is ``$SANDFISH_VAULT_PATH``, else
+    ``./sandfish_vault`` (see ``default_vault_path``).
+    """
+    app.state.config = {"ompa_vault_path": vault_path or default_vault_path(), "debug": debug}
     return app
 
 
